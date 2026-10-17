@@ -173,4 +173,14 @@ impl FuseGraph {
         g.store(OutputId(0), out);
         g
     }
+
+    /// Builds a single-pass fused residual addition graph: `out[i] = a[i] + b[i]`.
+    pub fn residual_add() -> Self {
+        let mut g = Self::new();
+        let a = g.load(InputId(0));
+        let b = g.load(InputId(1));
+        let out = g.add(a, b);
+        g.store(OutputId(0), out);
+        g
+    }
 }

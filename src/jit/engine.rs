@@ -126,6 +126,27 @@ impl JitEngine {
             kernel(inputs.as_ptr(), d.as_mut_ptr(), d.len());
         }
     }
+
+    /// Executes a 2-input, 1-output JIT kernel where input 0 is an [`ArenaSlice`] and input 1
+    /// is an external read-only `f32` weight slice (e.g. RMSNorm scale weights).
+    #[inline]
+    pub fn exec_with_weights(
+        &self,
+        kernel: JitKernelFn,
+        arena: &mut AlignedArena,
+        src: ArenaSlice,
+        weights: &[f32],
+        dst: ArenaSlice,
+    ) {
+        assert_eq!(src.len, dst.len, "src and dst length mismatch");
+        assert_eq!(weights.len(), dst.len, "weights and dst length mismatch");
+        assert_eq!(dst.len % 4, 0, "SIMD kernel length must be a multiple of 4");
+        let (s, d) = arena.io_slices(src, dst);
+        let inputs = [s.as_ptr(), weights.as_ptr()];
+        unsafe {
+            kernel(inputs.as_ptr(), d.as_mut_ptr(), d.len());
+        }
+    }
 }
 
 #[cfg(test)]

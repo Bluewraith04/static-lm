@@ -23,6 +23,15 @@ impl ArenaSlice {
     pub const fn overlaps(&self, other: &ArenaSlice) -> bool {
         self.offset < other.end() && other.offset < self.end()
     }
+
+    #[inline(always)]
+    pub const fn subslice(&self, rel_offset: usize, len: usize) -> ArenaSlice {
+        assert!(rel_offset + len <= self.len, "ArenaSlice::subslice out of bounds");
+        ArenaSlice {
+            offset: self.offset + rel_offset,
+            len,
+        }
+    }
 }
 
 /// Pre-allocated 64-byte aligned contiguous `f32` activation scratchpad.
@@ -236,6 +245,48 @@ impl AlignedArena {
             (src_slice, q8_slice, dst_slice)
         }
     }
+
+    /// Simultaneously borrows `q`, `k_cache`, and `v_cache` as immutable slices, and
+    /// `att` and `out` as disjoint mutable slices for causal multi-head attention.
+    #[inline(always)]
+    pub fn attention_slices(
+        &mut self,
+        q: ArenaSlice,
+        k_cache: ArenaSlice,
+        v_cache: ArenaSlice,
+        att: ArenaSlice,
+        out: ArenaSlice,
+    ) -> (&[f32], &[f32], &[f32], &mut [f32], &mut [f32]) {
+        assert!(
+            q.end() <= self.capacity
+                && k_cache.end() <= self.capacity
+                && v_cache.end() <= self.capacity
+                && att.end() <= self.capacity
+                && out.end() <= self.capacity,
+            "ArenaSlice out of bounds"
+        );
+        assert!(
+            !att.overlaps(&out)
+                && !att.overlaps(&q)
+                && !att.overlaps(&k_cache)
+                && !att.overlaps(&v_cache)
+                && !out.overlaps(&q)
+                && !out.overlaps(&k_cache)
+                && !out.overlaps(&v_cache),
+            "attention_slices: mutable outputs must not overlap inputs or each other"
+        );
+        let base = self.ptr.as_ptr();
+        // SAFETY: Bounds and non-overlap of mutable slices verified above.
+        unsafe {
+            (
+                std::slice::from_raw_parts(base.add(q.offset), q.len),
+                std::slice::from_raw_parts(base.add(k_cache.offset), k_cache.len),
+                std::slice::from_raw_parts(base.add(v_cache.offset), v_cache.len),
+                std::slice::from_raw_parts_mut(base.add(att.offset), att.len),
+                std::slice::from_raw_parts_mut(base.add(out.offset), out.len),
+            )
+        }
+    }
 }
 
 impl Drop for AlignedArena {
@@ -248,7 +299,7 @@ impl Drop for AlignedArena {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::quant::blocks::{BlockQ4_0, QK4_0, quantize_row_q4_0, quantize_row_q8_0};
     use crate::quant::kernels::{gemv_q4_0, gemv_q4_0_arena};
@@ -286,7 +337,7 @@ mod tests {
     #[global_allocator]
     static GLOBAL_ALLOC: ThreadCountingAllocator = ThreadCountingAllocator;
 
-    fn current_thread_allocs() -> usize {
+    pub(crate) fn current_thread_allocs() -> usize {
         ALLOC_COUNT.with(|c| c.get())
     }
 
