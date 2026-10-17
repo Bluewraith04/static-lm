@@ -111,6 +111,24 @@ pub fn gemv_q4_0(
     }
 }
 
+/// Zero-allocation arena-backed quantized Matrix-Vector multiplication (`output = weights * input`).
+/// Dynamically quantizes `input` into `q8_scratch` inside `arena` before executing `gemv_q4_0`.
+pub fn gemv_q4_0_arena(
+    arena: &mut crate::memory::arena::AlignedArena,
+    weights: &[BlockQ4_0],
+    input: crate::memory::arena::ArenaSlice,
+    q8_scratch: crate::memory::arena::ArenaSlice,
+    output: crate::memory::arena::ArenaSlice,
+    rows: usize,
+    cols: usize,
+) {
+    assert_eq!(cols % QK4_0, 0, "cols must be a multiple of 32");
+    let blocks_per_row = cols / QK4_0;
+    let (x_f32, x_q8, y_f32) = arena.gemv_slices(input, q8_scratch, output, blocks_per_row);
+    crate::quant::blocks::quantize_row_q8_0(x_f32, x_q8);
+    gemv_q4_0(weights, x_q8, y_f32, rows, cols);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
