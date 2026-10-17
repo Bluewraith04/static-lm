@@ -1,0 +1,21 @@
+[package]
+name = "inference-kernel"
+version = "0.1.0"
+edition = "2024"
+description = "Zero-allocation mmap quantized runtime and Cranelift IR kernel fusion engine"
+
+[dependencies]
+bytemuck = { version = "1.21", features = ["derive"] }
+half = { version = "2.4", features = ["bytemuck"] }
+memmap2 = "0.9"
+cranelift-codegen = "0.116"
+cranelift-frontend = "0.116"
+cranelift-jit = "0.116"
+cranelift-module = "0.116"
+cranelift-native = "0.116"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
