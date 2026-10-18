@@ -2,14 +2,15 @@ use crate::jit::engine::{JitEngine, JitKernelFn};
 use crate::jit::graph::FuseGraph;
 use crate::memory::arena::{AlignedArena, ArenaSlice};
 use crate::quant::blocks::{BlockQ4_0, QK4_0, dequantize_row_q4_0};
-use crate::quant::kernels::gemv_q4_0_arena;
+use crate::quant::kernels::{gemm_q4_0_arena, gemv_q4_0_arena};
 
-/// Flat concrete hyperparameters for a single Transformer block.
+/// Flat concrete hyperparameters for a Transformer block (supports both MHA and GQA).
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct TransformerConfig {
     pub dim: usize,
     pub hidden_dim: usize,
     pub num_heads: usize,
+    pub num_kv_heads: usize,
     pub max_seq_len: usize,
     pub rms_eps: f32,
 }
@@ -18,6 +19,16 @@ impl TransformerConfig {
     #[inline(always)]
     pub const fn head_dim(&self) -> usize {
         self.dim / self.num_heads
+    }
+
+    #[inline(always)]
+    pub const fn kv_dim(&self) -> usize {
+        (self.dim / self.num_heads) * self.num_kv_heads
+    }
+
+    #[inline(always)]
+    pub const fn kv_mul(&self) -> usize {
+        self.num_heads / self.num_kv_heads
     }
 }
 
@@ -45,7 +56,7 @@ pub struct ModelWeights<'a> {
     pub vocab_size: usize,
 }
 
-/// Pre-allocated [`ArenaSlice`] handles for zero-allocation execution of a Transformer layer.
+/// Pre-allocated [`ArenaSlice`] handles for zero-allocation execution of a single-token Transformer step.
 #[derive(Copy, Clone, Debug)]
 pub struct LayerWorkspace {
     pub x: ArenaSlice,
@@ -73,13 +84,21 @@ impl LayerWorkspace {
             0,
             "hidden_dim must be a multiple of 32"
         );
+        assert!(cfg.num_heads > 0 && cfg.num_kv_heads > 0);
         assert_eq!(
             cfg.dim % cfg.num_heads,
             0,
             "dim must be divisible by num_heads"
         );
+        assert_eq!(
+            cfg.num_heads % cfg.num_kv_heads,
+            0,
+            "num_heads must be divisible by num_kv_heads"
+        );
         let head_dim = cfg.head_dim();
+        let kv_dim = cfg.kv_dim();
         assert_eq!(head_dim % 2, 0, "head_dim must be even for RoPE rotation");
+        assert_eq!(kv_dim % QK4_0, 0, "kv_dim must be a multiple of 32");
 
         let max_q8_blocks = cfg.dim.max(cfg.hidden_dim) / QK4_0;
         let half_head = head_dim / 2;
@@ -91,8 +110,8 @@ impl LayerWorkspace {
             xb: arena.alloc_slice(cfg.dim),
             xb2: arena.alloc_slice(cfg.dim),
             q: arena.alloc_slice(cfg.dim),
-            k_cache: arena.alloc_slice(cfg.max_seq_len * cfg.dim),
-            v_cache: arena.alloc_slice(cfg.max_seq_len * cfg.dim),
+            k_cache: arena.alloc_slice(cfg.max_seq_len * kv_dim),
+            v_cache: arena.alloc_slice(cfg.max_seq_len * kv_dim),
             att: arena.alloc_slice(cfg.num_heads * cfg.max_seq_len),
             hb: arena.alloc_slice(cfg.hidden_dim),
             hb2: arena.alloc_slice(cfg.hidden_dim),
@@ -115,6 +134,45 @@ impl LayerWorkspace {
         }
 
         ws
+    }
+}
+
+/// Pre-allocated [`ArenaSlice`] handles for batched prompt prefill via [`gemm_q4_0_arena`].
+#[derive(Copy, Clone, Debug)]
+pub struct BatchWorkspace {
+    pub max_batch_size: usize,
+    pub x_batch: ArenaSlice,
+    pub x_mid_batch: ArenaSlice,
+    pub xb_batch: ArenaSlice,
+    pub xb2_batch: ArenaSlice,
+    pub q_batch: ArenaSlice,
+    pub hb_batch: ArenaSlice,
+    pub hb2_batch: ArenaSlice,
+    pub hb_act_batch: ArenaSlice,
+    pub q8_scratch: ArenaSlice,
+}
+
+impl BatchWorkspace {
+    /// Bump-allocates batched activation and `Q8_0` scratch buffers for up to `max_batch_size` tokens.
+    pub fn allocate(
+        arena: &mut AlignedArena,
+        cfg: &TransformerConfig,
+        max_batch_size: usize,
+    ) -> Self {
+        let max_b = max_batch_size.max(1);
+        let max_q8_blocks = max_b * (cfg.dim.max(cfg.hidden_dim) / QK4_0);
+        Self {
+            max_batch_size: max_b,
+            x_batch: arena.alloc_slice(max_b * cfg.dim),
+            x_mid_batch: arena.alloc_slice(max_b * cfg.dim),
+            xb_batch: arena.alloc_slice(max_b * cfg.dim),
+            xb2_batch: arena.alloc_slice(max_b * cfg.dim),
+            q_batch: arena.alloc_slice(max_b * cfg.dim),
+            hb_batch: arena.alloc_slice(max_b * cfg.hidden_dim),
+            hb2_batch: arena.alloc_slice(max_b * cfg.hidden_dim),
+            hb_act_batch: arena.alloc_slice(max_b * cfg.hidden_dim),
+            q8_scratch: arena.alloc_q8_scratch(max_q8_blocks),
+        }
     }
 }
 
@@ -154,7 +212,7 @@ pub fn apply_rope_in_place(vec: &mut [f32], pos: usize, head_dim: usize) {
     }
 }
 
-/// Executes causal multi-head scaled dot-product attention over `0..=pos` using the scalar reference softmax.
+/// Executes causal Multi-Head / Grouped-Query scaled dot-product attention over `0..=pos` (scalar reference).
 pub fn causal_multi_head_attention(
     q: &[f32],
     k_cache: &[f32],
@@ -165,19 +223,22 @@ pub fn causal_multi_head_attention(
     pos: usize,
 ) {
     let head_dim = cfg.head_dim();
+    let kv_dim = cfg.kv_dim();
+    let kv_mul = cfg.kv_mul();
     let scale = 1.0f32 / (head_dim as f32).sqrt();
     let seq_len = pos + 1;
 
     out.fill(0.0);
 
     for h in 0..cfg.num_heads {
-        let head_off = h * head_dim;
-        let q_h = &q[head_off..head_off + head_dim];
+        let q_head_off = h * head_dim;
+        let kv_head_off = (h / kv_mul) * head_dim;
+        let q_h = &q[q_head_off..q_head_off + head_dim];
         let att_h = &mut att[h * cfg.max_seq_len..h * cfg.max_seq_len + seq_len];
 
         let mut max_score = f32::NEG_INFINITY;
         for t in 0..seq_len {
-            let k_th = &k_cache[t * cfg.dim + head_off..t * cfg.dim + head_off + head_dim];
+            let k_th = &k_cache[t * kv_dim + kv_head_off..t * kv_dim + kv_head_off + head_dim];
             let mut dot = 0.0f32;
             for i in 0..head_dim {
                 dot += q_h[i] * k_th[i];
@@ -200,9 +261,9 @@ pub fn causal_multi_head_attention(
             *score *= inv_sum;
         }
 
-        let out_h = &mut out[head_off..head_off + head_dim];
+        let out_h = &mut out[q_head_off..q_head_off + head_dim];
         for (t, &prob) in att_h.iter().enumerate() {
-            let v_th = &v_cache[t * cfg.dim + head_off..t * cfg.dim + head_off + head_dim];
+            let v_th = &v_cache[t * kv_dim + kv_head_off..t * kv_dim + kv_head_off + head_dim];
             for i in 0..head_dim {
                 out_h[i] += prob * v_th[i];
             }
@@ -210,7 +271,8 @@ pub fn causal_multi_head_attention(
     }
 }
 
-/// Executes causal multi-head scaled dot-product attention over `0..=pos` using the JIT-compiled `Softmax` kernel.
+/// Executes causal Multi-Head / Grouped-Query scaled dot-product attention over `0..=pos`
+/// using the JIT-compiled `Softmax` kernel.
 pub fn causal_multi_head_attention_jit(
     q: &[f32],
     k_cache: &[f32],
@@ -222,18 +284,21 @@ pub fn causal_multi_head_attention_jit(
     softmax_fn: JitKernelFn,
 ) {
     let head_dim = cfg.head_dim();
+    let kv_dim = cfg.kv_dim();
+    let kv_mul = cfg.kv_mul();
     let scale = 1.0f32 / (head_dim as f32).sqrt();
     let seq_len = pos + 1;
 
     out.fill(0.0);
 
     for h in 0..cfg.num_heads {
-        let head_off = h * head_dim;
-        let q_h = &q[head_off..head_off + head_dim];
+        let q_head_off = h * head_dim;
+        let kv_head_off = (h / kv_mul) * head_dim;
+        let q_h = &q[q_head_off..q_head_off + head_dim];
         let att_h = &mut att[h * cfg.max_seq_len..h * cfg.max_seq_len + seq_len];
 
         for t in 0..seq_len {
-            let k_th = &k_cache[t * cfg.dim + head_off..t * cfg.dim + head_off + head_dim];
+            let k_th = &k_cache[t * kv_dim + kv_head_off..t * kv_dim + kv_head_off + head_dim];
             let mut dot = 0.0f32;
             for i in 0..head_dim {
                 dot += q_h[i] * k_th[i];
@@ -246,9 +311,9 @@ pub fn causal_multi_head_attention_jit(
             softmax_fn(inputs.as_ptr(), att_h.as_mut_ptr(), seq_len);
         }
 
-        let out_h = &mut out[head_off..head_off + head_dim];
+        let out_h = &mut out[q_head_off..q_head_off + head_dim];
         for (t, &prob) in att_h.iter().enumerate() {
-            let v_th = &v_cache[t * cfg.dim + head_off..t * cfg.dim + head_off + head_dim];
+            let v_th = &v_cache[t * kv_dim + kv_head_off..t * kv_dim + kv_head_off + head_dim];
             for i in 0..head_dim {
                 out_h[i] += prob * v_th[i];
             }
@@ -265,14 +330,15 @@ pub struct LayerKvCache {
 
 impl LayerKvCache {
     pub fn allocate(arena: &mut AlignedArena, cfg: &TransformerConfig) -> Self {
+        let kv_dim = cfg.kv_dim();
         Self {
-            k_cache: arena.alloc_slice(cfg.max_seq_len * cfg.dim),
-            v_cache: arena.alloc_slice(cfg.max_seq_len * cfg.dim),
+            k_cache: arena.alloc_slice(cfg.max_seq_len * kv_dim),
+            v_cache: arena.alloc_slice(cfg.max_seq_len * kv_dim),
         }
     }
 }
 
-/// Self-contained Transformer layer wiring quantized GEMV projections and JIT-fused CLIR kernels
+/// Self-contained Transformer layer wiring quantized GEMV/GEMM projections and JIT-fused CLIR kernels
 /// on [`AlignedArena`].
 pub struct TransformerLayer {
     pub config: TransformerConfig,
@@ -332,6 +398,7 @@ impl TransformerLayer {
         pos: usize,
     ) {
         let dim = self.config.dim;
+        let kv_dim = self.config.kv_dim();
         let hidden_dim = self.config.hidden_dim;
         let head_dim = self.config.head_dim();
         let half_head = head_dim / 2;
@@ -343,11 +410,11 @@ impl TransformerLayer {
         engine.exec_with_weights(self.rmsnorm_fn, arena, ws.x, weights.rms_att_weight, ws.xb);
 
         // 2. Quantized QKV Projections directly into q, kv.k_cache[pos], kv.v_cache[pos]
-        let k_pos = kv.k_cache.subslice(pos * dim, dim);
-        let v_pos = kv.v_cache.subslice(pos * dim, dim);
+        let k_pos = kv.k_cache.subslice(pos * kv_dim, kv_dim);
+        let v_pos = kv.v_cache.subslice(pos * kv_dim, kv_dim);
         gemv_q4_0_arena(arena, weights.wq, ws.xb, ws.q8_scratch, ws.q, dim, dim);
-        gemv_q4_0_arena(arena, weights.wk, ws.xb, ws.q8_scratch, k_pos, dim, dim);
-        gemv_q4_0_arena(arena, weights.wv, ws.xb, ws.q8_scratch, v_pos, dim, dim);
+        gemv_q4_0_arena(arena, weights.wk, ws.xb, ws.q8_scratch, k_pos, kv_dim, dim);
+        gemv_q4_0_arena(arena, weights.wv, ws.xb, ws.q8_scratch, v_pos, kv_dim, dim);
 
         // 3. Apply RoPE in place to Q and K[pos] using precomputed arena tables
         let cos_pos = ws.rope_cos.subslice(pos * half_head, half_head);
@@ -361,7 +428,7 @@ impl TransformerLayer {
             apply_rope_cached(k_s, cos_s, sin_s, head_dim);
         }
 
-        // 4. Causal Multi-Head Attention over 0..=pos with JIT Softmax -> xb
+        // 4. Causal Multi-Head / GQA Attention over 0..=pos with JIT Softmax -> xb
         {
             let (q_slice, kc_slice, vc_slice, att_slice, xb_slice) =
                 arena.attention_slices(ws.q, kv.k_cache, kv.v_cache, ws.att, ws.xb);
@@ -425,6 +492,182 @@ impl TransformerLayer {
         );
         engine.exec_binary(self.residual_add_fn, arena, ws.x_mid, ws.xb, ws.x);
     }
+
+    /// Executes a batched Transformer block over `batch_size` tokens starting at `start_pos`
+    /// using [`gemm_q4_0_arena`] and batched JIT kernels with zero heap allocations.
+    pub fn forward_batch_with_kv(
+        &self,
+        engine: &JitEngine,
+        arena: &mut AlignedArena,
+        bws: &BatchWorkspace,
+        weights: &TransformerWeights<'_>,
+        kv: &LayerKvCache,
+        start_pos: usize,
+        batch_size: usize,
+    ) {
+        assert!(batch_size > 0 && batch_size <= bws.max_batch_size);
+        assert!(start_pos + batch_size <= self.config.max_seq_len);
+
+        let dim = self.config.dim;
+        let kv_dim = self.config.kv_dim();
+        let hidden_dim = self.config.hidden_dim;
+        let head_dim = self.config.head_dim();
+        let half_head = head_dim / 2;
+        let ws = &self.workspace;
+
+        let x_b = bws.x_batch.subslice(0, batch_size * dim);
+        let x_mid_b = bws.x_mid_batch.subslice(0, batch_size * dim);
+        let xb_b = bws.xb_batch.subslice(0, batch_size * dim);
+        let xb2_b = bws.xb2_batch.subslice(0, batch_size * dim);
+        let q_b = bws.q_batch.subslice(0, batch_size * dim);
+        let hb_b = bws.hb_batch.subslice(0, batch_size * hidden_dim);
+        let hb2_b = bws.hb2_batch.subslice(0, batch_size * hidden_dim);
+        let hb_act_b = bws.hb_act_batch.subslice(0, batch_size * hidden_dim);
+
+        // 1. Pre-Attention JIT RMSNorm for each token in the batch
+        for b in 0..batch_size {
+            engine.exec_with_weights(
+                self.rmsnorm_fn,
+                arena,
+                x_b.subslice(b * dim, dim),
+                weights.rms_att_weight,
+                xb_b.subslice(b * dim, dim),
+            );
+        }
+
+        // 2. Batched QKV Projections via gemm_q4_0_arena
+        let k_batch = kv
+            .k_cache
+            .subslice(start_pos * kv_dim, batch_size * kv_dim);
+        let v_batch = kv
+            .v_cache
+            .subslice(start_pos * kv_dim, batch_size * kv_dim);
+        gemm_q4_0_arena(
+            arena,
+            weights.wq,
+            xb_b,
+            bws.q8_scratch,
+            q_b,
+            batch_size,
+            dim,
+            dim,
+        );
+        gemm_q4_0_arena(
+            arena,
+            weights.wk,
+            xb_b,
+            bws.q8_scratch,
+            k_batch,
+            batch_size,
+            kv_dim,
+            dim,
+        );
+        gemm_q4_0_arena(
+            arena,
+            weights.wv,
+            xb_b,
+            bws.q8_scratch,
+            v_batch,
+            batch_size,
+            kv_dim,
+            dim,
+        );
+
+        // 3 & 4. Apply cached RoPE and causal GQA attention per position in the batch
+        for b in 0..batch_size {
+            let pos = start_pos + b;
+            let q_pos = q_b.subslice(b * dim, dim);
+            let k_pos = kv.k_cache.subslice(pos * kv_dim, kv_dim);
+            let xb_pos = xb_b.subslice(b * dim, dim);
+            let cos_pos = ws.rope_cos.subslice(pos * half_head, half_head);
+            let sin_pos = ws.rope_sin.subslice(pos * half_head, half_head);
+
+            {
+                let (cos_s, sin_s, q_s) = arena.io2_slices(cos_pos, sin_pos, q_pos);
+                apply_rope_cached(q_s, cos_s, sin_s, head_dim);
+            }
+            {
+                let (cos_s, sin_s, k_s) = arena.io2_slices(cos_pos, sin_pos, k_pos);
+                apply_rope_cached(k_s, cos_s, sin_s, head_dim);
+            }
+            {
+                let (q_slice, kc_slice, vc_slice, att_slice, xb_slice) =
+                    arena.attention_slices(q_pos, kv.k_cache, kv.v_cache, ws.att, xb_pos);
+                causal_multi_head_attention_jit(
+                    q_slice,
+                    kc_slice,
+                    vc_slice,
+                    att_slice,
+                    xb_slice,
+                    &self.config,
+                    pos,
+                    self.softmax_fn,
+                );
+            }
+        }
+
+        // 5. Batched Output Projection via gemm_q4_0_arena + Batched JIT Residual Add
+        gemm_q4_0_arena(
+            arena,
+            weights.wo,
+            xb_b,
+            bws.q8_scratch,
+            xb2_b,
+            batch_size,
+            dim,
+            dim,
+        );
+        engine.exec_binary(self.residual_add_fn, arena, x_b, xb2_b, x_mid_b);
+
+        // 6. Pre-FFN JIT RMSNorm per token
+        for b in 0..batch_size {
+            engine.exec_with_weights(
+                self.rmsnorm_fn,
+                arena,
+                x_mid_b.subslice(b * dim, dim),
+                weights.rms_ffn_weight,
+                xb_b.subslice(b * dim, dim),
+            );
+        }
+
+        // 7. Batched FFN Gate & Up Projections via gemm_q4_0_arena
+        gemm_q4_0_arena(
+            arena,
+            weights.w_gate,
+            xb_b,
+            bws.q8_scratch,
+            hb_b,
+            batch_size,
+            hidden_dim,
+            dim,
+        );
+        gemm_q4_0_arena(
+            arena,
+            weights.w_up,
+            xb_b,
+            bws.q8_scratch,
+            hb2_b,
+            batch_size,
+            hidden_dim,
+            dim,
+        );
+
+        // 8. Batched Fused JIT SwiGLU across all `batch_size * hidden_dim` elements
+        engine.exec_binary(self.swiglu_fn, arena, hb_b, hb2_b, hb_act_b);
+
+        // 9. Batched FFN Down Projection via gemm_q4_0_arena + Batched JIT Residual Add
+        gemm_q4_0_arena(
+            arena,
+            weights.w_down,
+            hb_act_b,
+            bws.q8_scratch,
+            xb_b,
+            batch_size,
+            dim,
+            hidden_dim,
+        );
+        engine.exec_binary(self.residual_add_fn, arena, x_mid_b, xb_b, x_b);
+    }
 }
 
 /// Returns the index of the maximum logit value (greedy argmax token selection).
@@ -442,17 +685,51 @@ pub fn sample_argmax(logits: &[f32]) -> usize {
     best_idx
 }
 
+/// Computes the cosine similarity ($\mathbf{a} \cdot \mathbf{b}$) between two L2-normalized embedding slices.
+#[inline]
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    assert_eq!(a.len(), b.len(), "embedding dimension mismatch");
+    let mut dot = 0.0f32;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        dot += x * y;
+    }
+    dot
+}
+
+/// Ranks `num_docs` L2-normalized document embeddings (`doc_embs` of length `num_docs * dim`)
+/// against `query_emb` in descending cosine similarity order with zero heap allocations.
+pub fn rank_documents_by_cosine(
+    query_emb: &[f32],
+    doc_embs: &[f32],
+    dim: usize,
+    scores_out: &mut [(usize, f32)],
+) {
+    assert_eq!(query_emb.len(), dim);
+    let num_docs = scores_out.len();
+    assert_eq!(doc_embs.len(), num_docs * dim);
+
+    for (doc_idx, doc_vec) in doc_embs.chunks_exact(dim).enumerate() {
+        scores_out[doc_idx] = (doc_idx, cosine_similarity(query_emb, doc_vec));
+    }
+    scores_out.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+}
+
 /// End-to-end zero-allocation Transformer model executing `token_embd` lookup, `L` Transformer layers,
-/// final `RMSNorm`, `lm_head` vocabulary projection, and greedy token sampling on [`AlignedArena`].
+/// batched `GEMM` prompt prefill, greedy token generation, and JIT L2-normalized embedding extraction.
 pub struct TransformerModel {
     pub layer: TransformerLayer,
+    pub batch_workspace: BatchWorkspace,
     pub kv_caches: Vec<LayerKvCache>,
     pub logits: ArenaSlice,
+    pub embed_accum: ArenaSlice,
+    pub embed_norm: ArenaSlice,
+    pub l2_norm_fn: JitKernelFn,
     pub vocab_size: usize,
 }
 
 impl TransformerModel {
-    /// Allocates workspace, per-layer KV-caches, and vocabulary logits in `arena`, and compiles JIT kernels.
+    /// Allocates single-token and batch workspaces, per-layer KV-caches, logits, and embedding slices
+    /// in `arena`, and compiles all JIT kernels.
     pub fn new(
         engine: &mut JitEngine,
         arena: &mut AlignedArena,
@@ -462,16 +739,24 @@ impl TransformerModel {
     ) -> Self {
         assert!(vocab_size > 0, "vocab_size must be positive");
         let ws = LayerWorkspace::allocate(arena, &config);
+        let batch_workspace = BatchWorkspace::allocate(arena, &config, config.max_seq_len);
         let kv_caches = (0..num_layers)
             .map(|_| LayerKvCache::allocate(arena, &config))
             .collect();
         let logits = arena.alloc_slice(vocab_size);
+        let embed_accum = arena.alloc_slice(config.dim);
+        let embed_norm = arena.alloc_slice(config.dim);
+        let l2_norm_fn = engine.compile(&FuseGraph::l2_norm(config.rms_eps));
         let layer = TransformerLayer::new(engine, config, ws);
 
         Self {
             layer,
+            batch_workspace,
             kv_caches,
             logits,
+            embed_accum,
+            embed_norm,
+            l2_norm_fn,
             vocab_size,
         }
     }
@@ -529,6 +814,160 @@ impl TransformerModel {
         // 5. Greedy argmax token selection
         sample_argmax(arena.get(self.logits))
     }
+
+    /// Executes batched prompt prefill over `prompt_tokens` starting at `start_pos` using [`gemm_q4_0_arena`],
+    /// returning the greedy argmax next-token ID following the prompt with zero heap allocations.
+    pub fn prefill_tokens(
+        &self,
+        engine: &JitEngine,
+        arena: &mut AlignedArena,
+        weights: &ModelWeights<'_>,
+        prompt_tokens: &[usize],
+        start_pos: usize,
+    ) -> usize {
+        let batch_size = prompt_tokens.len();
+        assert!(batch_size > 0, "prompt_tokens cannot be empty");
+        let dim = self.layer.config.dim;
+        let blocks_per_row = dim / QK4_0;
+
+        for (b, &tok) in prompt_tokens.iter().enumerate() {
+            assert!(tok < self.vocab_size, "token_id out of vocabulary bounds");
+            let embd_row = &weights.token_embd[tok * blocks_per_row..(tok + 1) * blocks_per_row];
+            let dst = self.batch_workspace.x_batch.subslice(b * dim, dim);
+            dequantize_row_q4_0(embd_row, arena.get_mut(dst));
+        }
+
+        for (lw, kv) in weights.layers.iter().zip(self.kv_caches.iter()) {
+            self.layer.forward_batch_with_kv(
+                engine,
+                arena,
+                &self.batch_workspace,
+                lw,
+                kv,
+                start_pos,
+                batch_size,
+            );
+        }
+
+        let last_x = self
+            .batch_workspace
+            .x_batch
+            .subslice((batch_size - 1) * dim, dim);
+        engine.exec_with_weights(
+            self.layer.rmsnorm_fn,
+            arena,
+            last_x,
+            weights.output_norm,
+            self.layer.workspace.xb,
+        );
+
+        gemv_q4_0_arena(
+            arena,
+            weights.lm_head,
+            self.layer.workspace.xb,
+            self.layer.workspace.q8_scratch,
+            self.logits,
+            self.vocab_size,
+            dim,
+        );
+
+        sample_argmax(arena.get(self.logits))
+    }
+
+    /// Runs batched prompt prefill on `prompt_tokens` followed by autoregressive generation into `out_tokens`
+    /// with zero heap allocations. Returns the number of generated tokens written to `out_tokens`.
+    pub fn generate(
+        &self,
+        engine: &JitEngine,
+        arena: &mut AlignedArena,
+        weights: &ModelWeights<'_>,
+        prompt_tokens: &[usize],
+        out_tokens: &mut [usize],
+        eos_token_id: Option<usize>,
+    ) -> usize {
+        if out_tokens.is_empty() || prompt_tokens.is_empty() {
+            return 0;
+        }
+        let max_seq = self.layer.config.max_seq_len;
+        assert!(prompt_tokens.len() <= max_seq);
+
+        let mut next_tok = self.prefill_tokens(engine, arena, weights, prompt_tokens, 0);
+        out_tokens[0] = next_tok;
+        let mut generated = 1usize;
+
+        if eos_token_id == Some(next_tok) {
+            return generated;
+        }
+
+        let mut pos = prompt_tokens.len();
+        while generated < out_tokens.len() && pos < max_seq {
+            next_tok = self.forward_token(engine, arena, weights, next_tok, pos);
+            out_tokens[generated] = next_tok;
+            generated += 1;
+            pos += 1;
+            if eos_token_id == Some(next_tok) {
+                break;
+            }
+        }
+        generated
+    }
+
+    /// Computes a mean-pooled, JIT L2-normalized semantic embedding vector (`out_embedding` of length `dim`)
+    /// for `tokens` using batched `GEMM` prefill with zero heap allocations.
+    pub fn embed_tokens(
+        &self,
+        engine: &JitEngine,
+        arena: &mut AlignedArena,
+        weights: &ModelWeights<'_>,
+        tokens: &[usize],
+        out_embedding: &mut [f32],
+    ) {
+        let batch_size = tokens.len();
+        assert!(batch_size > 0, "tokens cannot be empty");
+        let dim = self.layer.config.dim;
+        assert_eq!(out_embedding.len(), dim, "out_embedding length mismatch");
+        let blocks_per_row = dim / QK4_0;
+
+        for (b, &tok) in tokens.iter().enumerate() {
+            assert!(tok < self.vocab_size, "token_id out of vocabulary bounds");
+            let embd_row = &weights.token_embd[tok * blocks_per_row..(tok + 1) * blocks_per_row];
+            let dst = self.batch_workspace.x_batch.subslice(b * dim, dim);
+            dequantize_row_q4_0(embd_row, arena.get_mut(dst));
+        }
+
+        for (lw, kv) in weights.layers.iter().zip(self.kv_caches.iter()) {
+            self.layer.forward_batch_with_kv(
+                engine,
+                arena,
+                &self.batch_workspace,
+                lw,
+                kv,
+                0,
+                batch_size,
+            );
+        }
+
+        arena.get_mut(self.embed_accum).fill(0.0);
+        let inv_batch = 1.0f32 / (batch_size as f32);
+        for b in 0..batch_size {
+            let x_b = self.batch_workspace.x_batch.subslice(b * dim, dim);
+            engine.exec_with_weights(
+                self.layer.rmsnorm_fn,
+                arena,
+                x_b,
+                weights.output_norm,
+                self.layer.workspace.xb,
+            );
+            let (normed_b, accum) = arena.io_slices(self.layer.workspace.xb, self.embed_accum);
+            for i in 0..dim {
+                accum[i] += normed_b[i] * inv_batch;
+            }
+        }
+
+        // Apply JIT-compiled 2-pass L2 normalization: embed_norm = embed_accum / ||embed_accum||_2
+        engine.exec_unary(self.l2_norm_fn, arena, self.embed_accum, self.embed_norm);
+        out_embedding.copy_from_slice(arena.get(self.embed_norm));
+    }
 }
 
 #[cfg(test)]
@@ -561,7 +1000,10 @@ mod tests {
     fn scalar_rmsnorm(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
         let sum_sq: f32 = x.iter().map(|&v| v * v).sum();
         let rms = 1.0 / (sum_sq / (x.len() as f32) + eps).sqrt();
-        x.iter().zip(weight.iter()).map(|(&xi, &wi)| xi * rms * wi).collect()
+        x.iter()
+            .zip(weight.iter())
+            .map(|(&xi, &wi)| xi * rms * wi)
+            .collect()
     }
 
     fn scalar_gemv(w: &[BlockQ4_0], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
@@ -582,6 +1024,7 @@ mod tests {
             dim: 64,
             hidden_dim: 128,
             num_heads: 4,
+            num_kv_heads: 4,
             max_seq_len: 8,
             rms_eps: 1e-5,
         };
@@ -675,11 +1118,117 @@ mod tests {
     }
 
     #[test]
+    fn test_gqa_transformer_layer_matches_scalar_reference() {
+        let cfg = TransformerConfig {
+            dim: 128,
+            hidden_dim: 256,
+            num_heads: 8,
+            num_kv_heads: 2, // 4:1 GQA ratio (kv_dim = 32)
+            max_seq_len: 8,
+            rms_eps: 1e-5,
+        };
+        let kv_dim = cfg.kv_dim();
+        assert_eq!(kv_dim, 32);
+
+        let rms_att_w = pseudo_random_f32(cfg.dim, 0x1101);
+        let rms_ffn_w = pseudo_random_f32(cfg.dim, 0x1102);
+        let wq = quantize_matrix(cfg.dim, cfg.dim, 0x2101);
+        let wk = quantize_matrix(kv_dim, cfg.dim, 0x2102);
+        let wv = quantize_matrix(kv_dim, cfg.dim, 0x2103);
+        let wo = quantize_matrix(cfg.dim, cfg.dim, 0x2104);
+        let w_gate = quantize_matrix(cfg.hidden_dim, cfg.dim, 0x3101);
+        let w_up = quantize_matrix(cfg.hidden_dim, cfg.dim, 0x3102);
+        let w_down = quantize_matrix(cfg.dim, cfg.hidden_dim, 0x3103);
+
+        let weights = TransformerWeights {
+            rms_att_weight: &rms_att_w,
+            wq: &wq,
+            wk: &wk,
+            wv: &wv,
+            wo: &wo,
+            rms_ffn_weight: &rms_ffn_w,
+            w_gate: &w_gate,
+            w_up: &w_up,
+            w_down: &w_down,
+        };
+
+        let mut engine = JitEngine::new();
+        let mut arena = AlignedArena::with_capacity(16384);
+        let ws = LayerWorkspace::allocate(&mut arena, &cfg);
+        let layer = TransformerLayer::new(&mut engine, cfg, ws);
+
+        let init_x = pseudo_random_f32(cfg.dim, 0x8888);
+        arena.get_mut(layer.workspace.x).copy_from_slice(&init_x);
+
+        let mut ref_x = init_x;
+        let mut ref_k_cache = vec![0.0f32; cfg.max_seq_len * kv_dim];
+        let mut ref_v_cache = vec![0.0f32; cfg.max_seq_len * kv_dim];
+        let mut ref_att = vec![0.0f32; cfg.num_heads * cfg.max_seq_len];
+
+        let ops_before = current_thread_heap_ops();
+        for pos in 0..4 {
+            layer.forward_token(&engine, &mut arena, &weights, pos);
+        }
+        let ops_after = current_thread_heap_ops();
+        assert_eq!(ops_after, ops_before, "GQA forward_token must not allocate");
+
+        for pos in 0..4 {
+            let xb = scalar_rmsnorm(&ref_x, &rms_att_w, cfg.rms_eps);
+            let mut q = scalar_gemv(&wq, &xb, cfg.dim, cfg.dim);
+            let mut k = scalar_gemv(&wk, &xb, kv_dim, cfg.dim);
+            let v = scalar_gemv(&wv, &xb, kv_dim, cfg.dim);
+
+            apply_rope_in_place(&mut q, pos, cfg.head_dim());
+            apply_rope_in_place(&mut k, pos, cfg.head_dim());
+
+            ref_k_cache[pos * kv_dim..(pos + 1) * kv_dim].copy_from_slice(&k);
+            ref_v_cache[pos * kv_dim..(pos + 1) * kv_dim].copy_from_slice(&v);
+
+            let mut att_out = vec![0.0f32; cfg.dim];
+            causal_multi_head_attention(
+                &q,
+                &ref_k_cache,
+                &ref_v_cache,
+                &mut ref_att,
+                &mut att_out,
+                &cfg,
+                pos,
+            );
+
+            let wo_out = scalar_gemv(&wo, &att_out, cfg.dim, cfg.dim);
+            let x_mid: Vec<f32> = ref_x.iter().zip(wo_out.iter()).map(|(a, b)| a + b).collect();
+
+            let ffn_in = scalar_rmsnorm(&x_mid, &rms_ffn_w, cfg.rms_eps);
+            let gate = scalar_gemv(&w_gate, &ffn_in, cfg.hidden_dim, cfg.dim);
+            let up = scalar_gemv(&w_up, &ffn_in, cfg.hidden_dim, cfg.dim);
+            let swiglu: Vec<f32> = gate
+                .iter()
+                .zip(up.iter())
+                .map(|(&g, &u)| (g / (1.0 + (-g).exp())) * u)
+                .collect();
+            let down = scalar_gemv(&w_down, &swiglu, cfg.dim, cfg.hidden_dim);
+            ref_x = x_mid.iter().zip(down.iter()).map(|(a, b)| a + b).collect();
+        }
+
+        let actual_x = arena.get(layer.workspace.x);
+        for i in 0..cfg.dim {
+            let diff = (actual_x[i] - ref_x[i]).abs();
+            assert!(
+                diff < 1e-4,
+                "GQA dim {i} mismatch: actual={}, ref={}, diff={diff}",
+                actual_x[i],
+                ref_x[i]
+            );
+        }
+    }
+
+    #[test]
     fn test_transformer_layer_zero_heap_allocations() {
         let cfg = TransformerConfig {
             dim: 128,
             hidden_dim: 256,
             num_heads: 4,
+            num_kv_heads: 4,
             max_seq_len: 16,
             rms_eps: 1e-5,
         };
@@ -731,11 +1280,12 @@ mod tests {
     }
 
     #[test]
-    fn test_end_to_end_model_token_generation_zero_alloc() {
+    fn test_prefill_batch_matches_sequential_forward_token_and_zero_alloc() {
         let cfg = TransformerConfig {
             dim: 64,
             hidden_dim: 128,
             num_heads: 4,
+            num_kv_heads: 2,
             max_seq_len: 16,
             rms_eps: 1e-5,
         };
@@ -749,8 +1299,8 @@ mod tests {
         let rms_att_w = pseudo_random_f32(cfg.dim, 0x1001);
         let rms_ffn_w = pseudo_random_f32(cfg.dim, 0x1002);
         let wq = quantize_matrix(cfg.dim, cfg.dim, 0x2001);
-        let wk = quantize_matrix(cfg.dim, cfg.dim, 0x2002);
-        let wv = quantize_matrix(cfg.dim, cfg.dim, 0x2003);
+        let wk = quantize_matrix(cfg.kv_dim(), cfg.dim, 0x2002);
+        let wv = quantize_matrix(cfg.kv_dim(), cfg.dim, 0x2003);
         let wo = quantize_matrix(cfg.dim, cfg.dim, 0x2004);
         let w_gate = quantize_matrix(cfg.hidden_dim, cfg.dim, 0x3001);
         let w_up = quantize_matrix(cfg.hidden_dim, cfg.dim, 0x3002);
@@ -776,23 +1326,160 @@ mod tests {
             vocab_size,
         };
 
+        let prompt = [1usize, 7, 19, 42];
+
+        // 1. Sequential token-by-token reference
+        let mut engine_seq = JitEngine::new();
+        let mut arena_seq = AlignedArena::with_capacity(131072);
+        let model_seq =
+            TransformerModel::new(&mut engine_seq, &mut arena_seq, cfg, num_layers, vocab_size);
+        let mut seq_next = 0;
+        for (pos, &tok) in prompt.iter().enumerate() {
+            seq_next = model_seq.forward_token(&engine_seq, &mut arena_seq, &model_weights, tok, pos);
+        }
+
+        // 2. Batched GEMM prefill + generate
+        let mut engine_batch = JitEngine::new();
+        let mut arena_batch = AlignedArena::with_capacity(131072);
+        let model_batch = TransformerModel::new(
+            &mut engine_batch,
+            &mut arena_batch,
+            cfg,
+            num_layers,
+            vocab_size,
+        );
+
+        let mut out_tokens = [0usize; 4];
+        let ops_before = current_thread_heap_ops();
+        let count = model_batch.generate(
+            &engine_batch,
+            &mut arena_batch,
+            &model_weights,
+            &prompt,
+            &mut out_tokens,
+            None,
+        );
+        let ops_after = current_thread_heap_ops();
+
+        assert_eq!(count, 4);
+        assert_eq!(
+            ops_after, ops_before,
+            "TransformerModel::generate (prefill + decode) must perform 0 heap ops"
+        );
+        assert_eq!(
+            out_tokens[0], seq_next,
+            "Batched GEMM prefill first generated token must match sequential forward_token"
+        );
+    }
+
+    #[test]
+    fn test_jit_l2_norm_and_semantic_embedding_search_zero_alloc() {
+        let cfg = TransformerConfig {
+            dim: 64,
+            hidden_dim: 128,
+            num_heads: 4,
+            num_kv_heads: 2,
+            max_seq_len: 16,
+            rms_eps: 1e-5,
+        };
+        let vocab_size = 64;
+        let num_layers = 2;
+
         let mut engine = JitEngine::new();
-        let mut arena = AlignedArena::with_capacity(65536);
+        let (_, l2_stats) = engine.compile_with_stats(&FuseGraph::l2_norm(cfg.rms_eps));
+        assert_eq!(l2_stats.num_stack_slots, 0);
+        assert!(!l2_stats.has_call_insts);
+        assert_eq!(l2_stats.num_loops, 2);
+        assert_eq!(
+            l2_stats.final_loop_sqrt_or_div, 0,
+            "l2_norm sqrt/recip must be hoisted out of Pass 2 loop"
+        );
+
+        let token_embd = quantize_matrix(vocab_size, cfg.dim, 0x0500);
+        let output_norm = vec![1.0f32; cfg.dim];
+        let lm_head = quantize_matrix(vocab_size, cfg.dim, 0x0600);
+        let rms_att_w = pseudo_random_f32(cfg.dim, 0x1501);
+        let rms_ffn_w = pseudo_random_f32(cfg.dim, 0x1502);
+        let wq = quantize_matrix(cfg.dim, cfg.dim, 0x2501);
+        let wk = quantize_matrix(cfg.kv_dim(), cfg.dim, 0x2502);
+        let wv = quantize_matrix(cfg.kv_dim(), cfg.dim, 0x2503);
+        let wo = quantize_matrix(cfg.dim, cfg.dim, 0x2504);
+        let w_gate = quantize_matrix(cfg.hidden_dim, cfg.dim, 0x3501);
+        let w_up = quantize_matrix(cfg.hidden_dim, cfg.dim, 0x3502);
+        let w_down = quantize_matrix(cfg.dim, cfg.hidden_dim, 0x3503);
+
+        let lw = TransformerWeights {
+            rms_att_weight: &rms_att_w,
+            wq: &wq,
+            wk: &wk,
+            wv: &wv,
+            wo: &wo,
+            rms_ffn_weight: &rms_ffn_w,
+            w_gate: &w_gate,
+            w_up: &w_up,
+            w_down: &w_down,
+        };
+        let model_weights = ModelWeights {
+            token_embd: &token_embd,
+            layers: vec![lw; num_layers],
+            output_norm: &output_norm,
+            lm_head: &lm_head,
+            vocab_size,
+        };
+
+        let mut arena = AlignedArena::with_capacity(131072);
         let model = TransformerModel::new(&mut engine, &mut arena, cfg, num_layers, vocab_size);
 
+        let doc0_tokens = [1usize, 4, 8, 12];
+        let doc1_tokens = [1usize, 20, 35, 50];
+        let query_tokens = [1usize, 4, 8, 12]; // Identical to doc0
+
+        let mut doc_embs = vec![0.0f32; 2 * cfg.dim];
+        let mut query_emb = vec![0.0f32; cfg.dim];
+        let mut ranked = [(0usize, 0.0f32); 2];
+
         let ops_before = current_thread_heap_ops();
-        let mut cur_token = 1usize;
-        for pos in 0..8 {
-            let next_token = model.forward_token(&engine, &mut arena, &model_weights, cur_token, pos);
-            assert!(next_token < vocab_size);
-            cur_token = next_token;
-        }
+        model.embed_tokens(
+            &engine,
+            &mut arena,
+            &model_weights,
+            &doc0_tokens,
+            &mut doc_embs[0..cfg.dim],
+        );
+        model.embed_tokens(
+            &engine,
+            &mut arena,
+            &model_weights,
+            &doc1_tokens,
+            &mut doc_embs[cfg.dim..2 * cfg.dim],
+        );
+        model.embed_tokens(
+            &engine,
+            &mut arena,
+            &model_weights,
+            &query_tokens,
+            &mut query_emb,
+        );
+        rank_documents_by_cosine(&query_emb, &doc_embs, cfg.dim, &mut ranked);
         let ops_after = current_thread_heap_ops();
 
         assert_eq!(
             ops_after, ops_before,
-            "Expected 0 heap allocs/deallocs during full TransformerModel autoregressive decoding, found {:?}",
-            (ops_after.0 - ops_before.0, ops_after.1 - ops_before.1)
+            "embed_tokens and rank_documents_by_cosine must perform 0 heap ops"
         );
+
+        let norm_sq: f32 = query_emb.iter().map(|&v| v * v).sum();
+        assert!(
+            (norm_sq.sqrt() - 1.0).abs() < 1e-4,
+            "Embedding must have unit L2 norm, got {}",
+            norm_sq.sqrt()
+        );
+        assert_eq!(ranked[0].0, 0, "Exact match doc0 must rank first");
+        assert!(
+            (ranked[0].1 - 1.0).abs() < 1e-4,
+            "Exact match cosine similarity must be ~1.0, got {}",
+            ranked[0].1
+        );
+        assert!(ranked[0].1 > ranked[1].1);
     }
 }

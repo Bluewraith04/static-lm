@@ -1,8 +1,8 @@
 [package]
-name = "inference-kernel"
+name = "static-lm"
 version = "0.1.0"
 edition = "2024"
-description = "Zero-allocation mmap quantized runtime and Cranelift IR kernel fusion engine"
+description = "Runs GGUF language models in a single pre-allocated memory buffer with Cranelift JIT-compiled operators and no heap allocations during execution"
 
 [dependencies]
 bytemuck = { version = "1.21", features = ["derive"] }

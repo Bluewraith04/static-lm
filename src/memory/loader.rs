@@ -422,6 +422,44 @@ impl GgufFile {
         self.metadata.get(key).and_then(GgufValue::as_str)
     }
 
+    /// Zero-copy string array lookup from a `GgufValue::Array` of `STR` (`elem_type == 8`).
+    pub fn get_str_array(&self, key: &str) -> Option<Vec<&str>> {
+        let GgufValue::Array {
+            elem_type: 8,
+            len,
+            byte_offset,
+            byte_len,
+        } = *self.metadata.get(key)?
+        else {
+            return None;
+        };
+        let mut cursor = ByteCursor::new(&self.mmap[byte_offset..byte_offset + byte_len]);
+        let mut out = Vec::with_capacity(len);
+        for _ in 0..len {
+            out.push(cursor.read_str().ok()?);
+        }
+        Some(out)
+    }
+
+    /// Reads an `f32` array from a `GgufValue::Array` of `F32` (`elem_type == 6`).
+    pub fn get_f32_array(&self, key: &str) -> Option<Vec<f32>> {
+        let GgufValue::Array {
+            elem_type: 6,
+            len,
+            byte_offset,
+            byte_len,
+        } = *self.metadata.get(key)?
+        else {
+            return None;
+        };
+        let mut cursor = ByteCursor::new(&self.mmap[byte_offset..byte_offset + byte_len]);
+        let mut out = Vec::with_capacity(len);
+        for _ in 0..len {
+            out.push(cursor.read_f32().ok()?);
+        }
+        Some(out)
+    }
+
     fn raw_tensor_bytes(&self, name: &str, expected: GgmlType) -> Result<&[u8], GgufError> {
         let info = self
             .tensors
@@ -439,7 +477,10 @@ impl GgufFile {
             .ok_or_else(|| GgufError::OutOfBounds(name.to_owned()))?;
         let start = self
             .data_offset
-            .checked_add(usize::try_from(info.offset).map_err(|_| GgufError::OutOfBounds(name.to_owned()))?)
+            .checked_add(
+                usize::try_from(info.offset)
+                    .map_err(|_| GgufError::OutOfBounds(name.to_owned()))?,
+            )
             .ok_or_else(|| GgufError::OutOfBounds(name.to_owned()))?;
         let end = start
             .checked_add(byte_len)
@@ -510,9 +551,17 @@ impl GgufFile {
     }
 }
 
+enum WriterKv {
+    U32(u32),
+    F32(f32),
+    Str(String),
+    StrArray(Vec<String>),
+    F32Array(Vec<f32>),
+}
+
 /// Minimal GGUF v3 file writer for self-contained Rust tests and benchmark generation.
 pub struct GgufWriter {
-    kv_entries: Vec<(String, GgufValue)>,
+    kv_entries: Vec<(String, WriterKv)>,
     tensors: Vec<(String, GgmlType, Vec<u64>, Vec<u8>)>,
 }
 
@@ -531,16 +580,27 @@ impl GgufWriter {
     }
 
     pub fn add_u32(&mut self, key: &str, val: u32) {
-        self.kv_entries.push((key.to_owned(), GgufValue::U32(val)));
+        self.kv_entries.push((key.to_owned(), WriterKv::U32(val)));
     }
 
     pub fn add_f32(&mut self, key: &str, val: f32) {
-        self.kv_entries.push((key.to_owned(), GgufValue::F32(val)));
+        self.kv_entries.push((key.to_owned(), WriterKv::F32(val)));
     }
 
     pub fn add_str(&mut self, key: &str, val: &str) {
         self.kv_entries
-            .push((key.to_owned(), GgufValue::Str(val.to_owned())));
+            .push((key.to_owned(), WriterKv::Str(val.to_owned())));
+    }
+
+    pub fn add_str_array(&mut self, key: &str, vals: &[&str]) {
+        let arr = vals.iter().map(|&s| s.to_owned()).collect();
+        self.kv_entries
+            .push((key.to_owned(), WriterKv::StrArray(arr)));
+    }
+
+    pub fn add_f32_array(&mut self, key: &str, vals: &[f32]) {
+        self.kv_entries
+            .push((key.to_owned(), WriterKv::F32Array(vals.to_vec())));
     }
 
     pub fn add_tensor_f32(&mut self, name: &str, dims: &[u64], data: &[f32]) {
@@ -576,19 +636,34 @@ impl GgufWriter {
         for (k, v) in &self.kv_entries {
             write_str(&mut buf, k);
             match v {
-                GgufValue::U32(x) => {
+                WriterKv::U32(x) => {
                     buf.extend_from_slice(&4u32.to_le_bytes());
                     buf.extend_from_slice(&x.to_le_bytes());
                 }
-                GgufValue::F32(x) => {
+                WriterKv::F32(x) => {
                     buf.extend_from_slice(&6u32.to_le_bytes());
                     buf.extend_from_slice(&x.to_le_bytes());
                 }
-                GgufValue::Str(s) => {
+                WriterKv::Str(s) => {
                     buf.extend_from_slice(&8u32.to_le_bytes());
                     write_str(&mut buf, s);
                 }
-                _ => unimplemented!("GgufWriter only supports U32, F32, Str metadata"),
+                WriterKv::StrArray(items) => {
+                    buf.extend_from_slice(&9u32.to_le_bytes());
+                    buf.extend_from_slice(&8u32.to_le_bytes());
+                    buf.extend_from_slice(&(items.len() as u64).to_le_bytes());
+                    for s in items {
+                        write_str(&mut buf, s);
+                    }
+                }
+                WriterKv::F32Array(items) => {
+                    buf.extend_from_slice(&9u32.to_le_bytes());
+                    buf.extend_from_slice(&6u32.to_le_bytes());
+                    buf.extend_from_slice(&(items.len() as u64).to_le_bytes());
+                    for &x in items {
+                        buf.extend_from_slice(&x.to_le_bytes());
+                    }
+                }
             }
         }
 
