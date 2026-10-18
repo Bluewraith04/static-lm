@@ -252,7 +252,7 @@ fn main() {
     let mode = args.get(1).map(String::as_str).unwrap_or("all");
     let cli_path = if matches!(
         mode,
-        "bench" | "generate" | "embed" | "all" | "write-synthetic"
+        "bench" | "generate" | "embed" | "all" | "write-synthetic" | "run"
     ) {
         args.get(2).map(PathBuf::from)
     } else {
@@ -333,6 +333,23 @@ fn main() {
         cfg.num_kv_heads,
         model_weights.vocab_size
     );
+
+    if mode == "run" {
+        let prompt_len: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(16);
+        let gen_len: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(8);
+        let prompt_ids: Vec<usize> = (1..=prompt_len).collect();
+        let mut out = vec![0usize; gen_len];
+        let count = model.generate(
+            &engine,
+            &mut arena,
+            &model_weights,
+            &prompt_ids,
+            &mut out,
+            None,
+        );
+        println!("generated {count} tokens, last={}", out[count - 1]);
+        return;
+    }
 
     if matches!(mode, "generate" | "all") {
         if let Ok(tokenizer) = GgufTokenizer::from_gguf(&gguf) {

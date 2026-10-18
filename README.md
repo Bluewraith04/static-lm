@@ -35,32 +35,37 @@ Run throughput and baseline comparison benchmarks:
 cargo run --release -- bench path/to/model.gguf
 ```
 
+Load a model, prefill a prompt of N tokens, decode M tokens, and exit (used for end-to-end timing):
+
+```bash
+cargo run --release -- run path/to/model.gguf N M
+```
+
 Run the test suite (verifies quantization error bounds, SIMD parity, Cranelift IR register/loop invariants, and zero runtime heap allocations):
 
 ```bash
 cargo test
 ```
 
-## Benchmarks (`AMD Ryzen 5 PRO 4650U`, Pure `Q4_0` CPU, `prompt = 16`, `decode = 8`)
+## Benchmarks
 
-| Model | Runtime | Prefill (`tok/s`) | Decode (`tok/s`) | Runtime Heap Allocs | Static Memory |
-| :--- | :--- | ---: | ---: | ---: | ---: |
-| **Synthetic (`1.8M`, `0.95 MiB`)** | `llama.cpp` (`llama-bench`) | 42,385.9 | 11,209.4 | — | — |
-| | **`static-lm`** | **5,150.1** | **4,144.4** | **0 (`0 KB`)** | **1.0 MB** |
-| | HuggingFace `candle` (`0.8.4`) | 206.6 | 130.7 | Heap per op | — |
-| | In-tree static `f32` (`llama2.c`-style) | 633.6 | 583.8 | 0 (`0 KB`) | 6.8 MB |
-| | In-tree unfused scalar `Q4_0` | 514.7 | 398.3 | 0 (`0 KB`) | 1.0 MB |
-| **Stories-15M (`24.4M`, `13.1 MiB`)** | `llama.cpp` (`llama-bench`) | 4,251.8 | 636.6 | — | — |
-| | **`static-lm`** | **1,271.7** | **469.4** | **0 (`0 KB`)** | **16.6 MB** |
-| | HuggingFace `candle` (`0.8.4`) | 36.4 | 26.9 | Heap per op | — |
-| | In-tree static `f32` (`llama2.c`-style) | 147.2 | 65.7 | 0 (`0 KB`) | 96.6 MB |
-| | In-tree unfused scalar `Q4_0` | 129.7 | 65.9 | 0 (`0 KB`) | 16.6 MB |
-| **SmolLM2-135M (`134.5M`, `72.3 MiB`)** | `llama.cpp` (`llama-bench`) | 442.8 | 125.2 | — | — |
-| | **`static-lm`** | **78.4** | **54.6** | **0 (`0 KB`)** | **110.2 MB** |
-| | HuggingFace `candle` (`0.8.4`) | 7.1 | 5.1 | Heap per op | — |
-| | In-tree static `f32` (`llama2.c`-style) | 8.4 | 6.7 | 0 (`0 KB`) | 643.9 MB |
-| | In-tree unfused scalar `Q4_0` | 5.6 | 5.2 | 0 (`0 KB`) | 110.2 MB |
+`AMD Ryzen 5 PRO 4650U` (6 cores / 12 threads), pure `Q4_0` models, measured with `hyperfine -N --warmup 3` (mean ± σ, 10–30 runs). Each run is a full process: load the model, prefill a 16-token prompt, decode 8 tokens. `llama.cpp` is `llama-bench` built from source (`-DGGML_NATIVE=ON`, 3 threads); `candle` is `0.8.4` with `quantized_llama`.
 
-- **vs. HuggingFace `candle` (`0.8.4` CPU):** `static-lm` is **10.7×–17.4× faster on decode** and **11×–35× faster on prefill** on the two real-world models (`Stories-15M` and `SmolLM2-135M`).
-- **vs. `llama.cpp` (`ggml-cpu`):** `static-lm` reaches **44%–74% of `llama.cpp` decode throughput** (`469.4` vs. `636.6 tok/s` on `Stories-15M`; `54.6` vs. `125.2 tok/s` on `SmolLM2-135M`) and **18%–30% of its prefill throughput**. The remaining gap comes from `ggml`'s multi-row register-blocked `GEMV`/`GEMM` microkernels and SIMD attention scoring (`static-lm` uses single-row `Q4_0 × Q8_0` dot products and scalar `QK^T`/`AV` attention loops). `llama.cpp` figures were measured on the same machine with run-to-run variance of up to ±50% at these small sizes.
-- **vs. In-tree baselines:** `static-lm` is **7×–14× faster** than unfused scalar `Q4_0` and uses **5.8× less RAM** (`110.2 MB` vs. `643.9 MB` on `SmolLM2-135M`) than pre-dequantized `f32`, while avoiding the `14,552` heap allocations (`53.4 MB` of transient heap churn) of per-operator `Vec<f32>` execution.
+| Model | `static-lm` | `llama.cpp` | `candle` |
+| :--- | ---: | ---: | ---: |
+| Synthetic (`1.8M` params, `0.95 MiB`) | 76.0 ± 9.8 ms | **49.1 ± 8.5 ms** | 279.1 ± 29.6 ms |
+| Stories-15M (`24.4M`, `13.1 MiB`) | **114.6 ± 9.9 ms** | 200.8 ± 13.3 ms | 1,231 ± 65 ms |
+| SmolLM2-135M (`134.5M`, `72.3 MiB`) | **703 ± 82 ms** | 790 ± 131 ms | 6,520 ± 172 ms |
+
+Splitting the same measurement into startup and steady-state work (`static-lm` / `llama.cpp`):
+
+| Model | Startup (1-token prompt, 1 token decoded) | 16-token prompt + 64 tokens decoded |
+| :--- | ---: | ---: |
+| Stories-15M | **69 ms** / 197 ms | 340 ms / **289 ms** |
+| SmolLM2-135M | **165 ms** / 580 ms | 2.51 s / **1.30 s** |
+
+- **Startup:** `static-lm` reaches its first token 3× faster than `llama.cpp` on the real models, since it only maps the file, parses the header, and JIT-compiles a handful of small kernels.
+- **Sustained decoding:** `llama.cpp` is about 1.2× faster on Stories-15M and 1.9× faster on SmolLM2-135M. Total time favors `static-lm` only when a run is short enough for startup to dominate.
+- **CPU use:** `static-lm` workers spin between matrix multiplications, so it consumes roughly 2.5× the CPU time of `llama.cpp` for the same work (6.6 s user time vs. 2.6 s on the SmolLM2-135M run above).
+- **vs. `candle`:** `static-lm` is 9×–11× faster end to end on the real models.
+- **Memory:** weights stay `Q4_0` and all working memory is one arena; SmolLM2-135M needs about `110 MB` total versus about `644 MB` for the same model dequantized to `f32`.
