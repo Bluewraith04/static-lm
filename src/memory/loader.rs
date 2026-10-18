@@ -261,7 +261,8 @@ impl<'a> ByteCursor<'a> {
                 self.take(4)?;
             }
             8 => {
-                let len = usize::try_from(self.read_u64()?).map_err(|_| GgufError::UnexpectedEof)?;
+                let len =
+                    usize::try_from(self.read_u64()?).map_err(|_| GgufError::UnexpectedEof)?;
                 self.take(len)?;
             }
             9 => {
@@ -728,10 +729,8 @@ mod tests {
         let mut expected = vec![0.0f32; rows];
         gemv_q4_0(&w_q4, &x_q8, &mut expected, rows, cols);
 
-        let tmp_path = std::env::temp_dir().join(format!(
-            "inference_kernel_test_{}.gguf",
-            std::process::id()
-        ));
+        let tmp_path =
+            std::env::temp_dir().join(format!("inference_kernel_test_{}.gguf", std::process::id()));
 
         let mut writer = GgufWriter::new();
         writer.add_str("general.architecture", "llama");
@@ -883,10 +882,13 @@ mod tests {
         assert_eq!(gguf.get_f32("k_f64"), Some(2.25));
         assert!(matches!(
             gguf.metadata.get("k_arr"),
-            Some(GgufValue::Array { elem_type: 8, len: 2, .. })
+            Some(GgufValue::Array {
+                elem_type: 8,
+                len: 2,
+                ..
+            })
         ));
 
-        // Verify error cases
         assert!(matches!(
             gguf.tensor_f32("misaligned.weight"),
             Err(GgufError::UnalignedTensor(_))
@@ -900,14 +902,12 @@ mod tests {
             Err(GgufError::TensorNotFound(_))
         ));
 
-        // Invalid magic
         std::fs::write(&path, b"BAD!0000").unwrap();
         assert!(matches!(
             GgufFile::open(&path),
             Err(GgufError::InvalidMagic(_))
         ));
 
-        // Unsupported version
         let mut bad_ver = Vec::new();
         bad_ver.extend_from_slice(&GGUF_MAGIC.to_le_bytes());
         bad_ver.extend_from_slice(&99u32.to_le_bytes());
@@ -917,7 +917,6 @@ mod tests {
             Err(GgufError::UnsupportedVersion(99))
         ));
 
-        // Unexpected EOF
         std::fs::write(&path, &GGUF_MAGIC.to_le_bytes()).unwrap();
         assert!(matches!(
             GgufFile::open(&path),

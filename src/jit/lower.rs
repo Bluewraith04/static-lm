@@ -166,9 +166,7 @@ fn emit_node_scalar(
         OpNode::Load(in_id) => {
             let base = input_ptrs[in_id.0 as usize];
             let addr = builder.ins().iadd(base, byte_offset);
-            let scalar = builder
-                .ins()
-                .load(types::F32, MemFlags::trusted(), addr, 0);
+            let scalar = builder.ins().load(types::F32, MemFlags::trusted(), addr, 0);
             Some(builder.ins().splat(types::F32X4, scalar))
         }
         OpNode::Store { dst: _, src } => {
@@ -286,7 +284,9 @@ pub fn lower_fuse_graph(
 
         builder.switch_to_block(pass_header);
         let cur_idx = builder.use_var(idx_var);
-        let cond = builder.ins().icmp(IntCC::UnsignedLessThan, cur_idx, vec_len);
+        let cond = builder
+            .ins()
+            .icmp(IntCC::UnsignedLessThan, cur_idx, vec_len);
         builder.ins().brif(cond, pass_body, &[], vec_exit, &[]);
 
         builder.switch_to_block(pass_body);
@@ -346,7 +346,9 @@ pub fn lower_fuse_graph(
         builder.switch_to_block(tail_header);
         let tail_idx = builder.use_var(idx_var);
         let tail_cond = builder.ins().icmp(IntCC::UnsignedLessThan, tail_idx, len);
-        builder.ins().brif(tail_cond, tail_body, &[], pass_exit, &[]);
+        builder
+            .ins()
+            .brif(tail_cond, tail_body, &[], pass_exit, &[]);
 
         builder.switch_to_block(tail_body);
         let tail_byte_off = builder.ins().ishl_imm(tail_idx, 2);
@@ -408,7 +410,9 @@ pub fn lower_fuse_graph(
 
     builder.switch_to_block(store_header);
     let cur_idx = builder.use_var(store_idx_var);
-    let cond = builder.ins().icmp(IntCC::UnsignedLessThan, cur_idx, vec_len);
+    let cond = builder
+        .ins()
+        .icmp(IntCC::UnsignedLessThan, cur_idx, vec_len);
     builder
         .ins()
         .brif(cond, store_body, &[], store_tail_header, &[]);
@@ -438,7 +442,9 @@ pub fn lower_fuse_graph(
 
     builder.switch_to_block(store_tail_header);
     let tail_cur_idx = builder.use_var(store_idx_var);
-    let tail_cond = builder.ins().icmp(IntCC::UnsignedLessThan, tail_cur_idx, len);
+    let tail_cond = builder
+        .ins()
+        .icmp(IntCC::UnsignedLessThan, tail_cur_idx, len);
     builder
         .ins()
         .brif(tail_cond, store_tail_body, &[], store_exit, &[]);

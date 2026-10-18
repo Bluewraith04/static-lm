@@ -48,8 +48,9 @@ unsafe fn execute_row_chunks(
         }
         let r_end = (r_start + chunk_size).min(rows);
         for r in r_start..r_end {
-            let row_w =
-                unsafe { std::slice::from_raw_parts(w_ptr.add(r * blocks_per_row), blocks_per_row) };
+            let row_w = unsafe {
+                std::slice::from_raw_parts(w_ptr.add(r * blocks_per_row), blocks_per_row)
+            };
             for b in 0..batch_size {
                 let in_q8 = unsafe {
                     std::slice::from_raw_parts(in_ptr.add(b * blocks_per_row), blocks_per_row)
@@ -338,7 +339,8 @@ pub fn gemm_q4_0(
             if pool.num_workers > 0 {
                 if let Ok(_guard) = pool.dispatch_lock.try_lock() {
                     let st = pool.state;
-                    st.weights_ptr.store(weights.as_ptr() as usize, Ordering::Release);
+                    st.weights_ptr
+                        .store(weights.as_ptr() as usize, Ordering::Release);
                     st.input_q8_ptr
                         .store(inputs_q8.as_ptr() as usize, Ordering::Release);
                     st.output_ptr
@@ -378,10 +380,7 @@ pub fn gemm_q4_0(
     }
 
     if batch_size == 1 {
-        for (row_weights, out_val) in weights
-            .chunks_exact(blocks_per_row)
-            .zip(output.iter_mut())
-        {
+        for (row_weights, out_val) in weights.chunks_exact(blocks_per_row).zip(output.iter_mut()) {
             *out_val = vec_dot_q4_0_q8_0(row_weights, inputs_q8);
         }
     } else {
@@ -515,7 +514,10 @@ mod tests {
         let ops_before = current_thread_heap_ops();
         gemv_q4_0(&w_q4, &x_q8, &mut out_quant, rows, cols);
         let ops_after = current_thread_heap_ops();
-        assert_eq!(ops_after, ops_before, "parallel gemv_q4_0 must not allocate");
+        assert_eq!(
+            ops_after, ops_before,
+            "parallel gemv_q4_0 must not allocate"
+        );
 
         let mut total_rel_err = 0.0f32;
         for r in 0..rows {
@@ -573,7 +575,10 @@ mod tests {
         let ops_before = current_thread_heap_ops();
         gemm_q4_0_arena(&mut arena, &w_q4, s_in, s_q8, s_out, batch_size, rows, cols);
         let ops_after = current_thread_heap_ops();
-        assert_eq!(ops_after, ops_before, "gemm_q4_0_arena must perform 0 heap ops");
+        assert_eq!(
+            ops_after, ops_before,
+            "gemm_q4_0_arena must perform 0 heap ops"
+        );
 
         let out = arena.get(s_out);
         let mut x_q8_ref = vec![BlockQ8_0::zeroed(); batch_size * blocks_per_row];
@@ -615,17 +620,32 @@ mod tests {
         }
 
         let d_one = f16::from_f32(1.0).to_bits();
-        let w_min = [BlockQ4_0 { d: d_one, qs: [0x00; 16] }];
-        let w_max = [BlockQ4_0 { d: d_one, qs: [0xFF; 16] }];
-        let a_min = [BlockQ8_0 { d: d_one, qs: [-127; 32] }];
-        let a_max = [BlockQ8_0 { d: d_one, qs: [127; 32] }];
+        let w_min = [BlockQ4_0 {
+            d: d_one,
+            qs: [0x00; 16],
+        }];
+        let w_max = [BlockQ4_0 {
+            d: d_one,
+            qs: [0xFF; 16],
+        }];
+        let a_min = [BlockQ8_0 {
+            d: d_one,
+            qs: [-127; 32],
+        }];
+        let a_max = [BlockQ8_0 {
+            d: d_one,
+            qs: [127; 32],
+        }];
 
         assert_eq!(vec_dot_q4_0_q8_0(&w_min, &a_min), 32_512.0);
         assert_eq!(vec_dot_q4_0_q8_0_scalar(&w_min, &a_min), 32_512.0);
         assert_eq!(vec_dot_q4_0_q8_0(&w_max, &a_max), 28_448.0);
         assert_eq!(vec_dot_q4_0_q8_0_scalar(&w_max, &a_max), 28_448.0);
 
-        let a_i8_min = [BlockQ8_0 { d: d_one, qs: [-128; 32] }];
+        let a_i8_min = [BlockQ8_0 {
+            d: d_one,
+            qs: [-128; 32],
+        }];
         assert_eq!(vec_dot_q4_0_q8_0(&w_min, &a_i8_min), 32_512.0);
     }
 }

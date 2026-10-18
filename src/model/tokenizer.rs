@@ -116,7 +116,6 @@ impl GgufTokenizer {
             }
         }
 
-        // Iteratively merge the best adjacent pair according to explicit BPE merge ranks or token scores
         while symbols.len() >= 2 {
             let mut best_idx = None;
             let mut best_rank = usize::MAX;
@@ -199,8 +198,25 @@ mod tests {
     fn test_gguf_tokenizer_bpe_encode_decode_roundtrip() {
         let path = std::env::temp_dir().join("static_lm_tokenizer_test.gguf");
         let vocab = [
-            "<unk>", "<s>", "</s>", "▁", "s", "t", "a", "i", "c", "l", "m", "▁s", "▁st",
-            "▁sta", "▁stat", "▁stati", "▁static", "▁l", "▁lm",
+            "<unk>",
+            "<s>",
+            "</s>",
+            "▁",
+            "s",
+            "t",
+            "a",
+            "i",
+            "c",
+            "l",
+            "m",
+            "▁s",
+            "▁st",
+            "▁sta",
+            "▁stat",
+            "▁stati",
+            "▁static",
+            "▁l",
+            "▁lm",
         ];
         let scores: Vec<f32> = (0..vocab.len()).map(|i| i as f32).collect();
         let merges = [
@@ -230,7 +246,6 @@ mod tests {
         assert_eq!(tokenizer.vocab_size(), vocab.len());
 
         let ids_with_bos = tokenizer.encode("static lm", true);
-        // Expected: BOS (1), "▁static" (16), "▁lm" (18)
         assert_eq!(ids_with_bos, vec![1, 16, 18]);
 
         let decoded = tokenizer.decode(&ids_with_bos);

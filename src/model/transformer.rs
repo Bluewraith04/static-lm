@@ -121,7 +121,6 @@ impl LayerWorkspace {
             rope_sin: arena.alloc_slice(rope_table_len),
         };
 
-        // Precompute RoPE cos/sin lookup tables once during workspace initialization
         let head_dim_f = head_dim as f32;
         for pos in 0..cfg.max_seq_len {
             let pos_f = pos as f32;
@@ -402,21 +401,21 @@ impl TransformerLayer {
         let hidden_dim = self.config.hidden_dim;
         let head_dim = self.config.head_dim();
         let half_head = head_dim / 2;
-        assert!(pos < self.config.max_seq_len, "sequence position out of bounds");
+        assert!(
+            pos < self.config.max_seq_len,
+            "sequence position out of bounds"
+        );
 
         let ws = &self.workspace;
 
-        // 1. Pre-Attention JIT RMSNorm: xb = rmsnorm(x, rms_att_weight)
         engine.exec_with_weights(self.rmsnorm_fn, arena, ws.x, weights.rms_att_weight, ws.xb);
 
-        // 2. Quantized QKV Projections directly into q, kv.k_cache[pos], kv.v_cache[pos]
         let k_pos = kv.k_cache.subslice(pos * kv_dim, kv_dim);
         let v_pos = kv.v_cache.subslice(pos * kv_dim, kv_dim);
         gemv_q4_0_arena(arena, weights.wq, ws.xb, ws.q8_scratch, ws.q, dim, dim);
         gemv_q4_0_arena(arena, weights.wk, ws.xb, ws.q8_scratch, k_pos, kv_dim, dim);
         gemv_q4_0_arena(arena, weights.wv, ws.xb, ws.q8_scratch, v_pos, kv_dim, dim);
 
-        // 3. Apply RoPE in place to Q and K[pos] using precomputed arena tables
         let cos_pos = ws.rope_cos.subslice(pos * half_head, half_head);
         let sin_pos = ws.rope_sin.subslice(pos * half_head, half_head);
         {
@@ -428,7 +427,6 @@ impl TransformerLayer {
             apply_rope_cached(k_s, cos_s, sin_s, head_dim);
         }
 
-        // 4. Causal Multi-Head / GQA Attention over 0..=pos with JIT Softmax -> xb
         {
             let (q_slice, kc_slice, vc_slice, att_slice, xb_slice) =
                 arena.attention_slices(ws.q, kv.k_cache, kv.v_cache, ws.att, ws.xb);
@@ -444,11 +442,9 @@ impl TransformerLayer {
             );
         }
 
-        // 5. Output Projection: xb2 = Wo * xb, then JIT Residual Add: x_mid = x + xb2
         gemv_q4_0_arena(arena, weights.wo, ws.xb, ws.q8_scratch, ws.xb2, dim, dim);
         engine.exec_binary(self.residual_add_fn, arena, ws.x, ws.xb2, ws.x_mid);
 
-        // 6. Pre-FFN JIT RMSNorm: xb = rmsnorm(x_mid, rms_ffn_weight)
         engine.exec_with_weights(
             self.rmsnorm_fn,
             arena,
@@ -457,7 +453,6 @@ impl TransformerLayer {
             ws.xb,
         );
 
-        // 7. FFN Gate & Up Projections: hb = W_gate * xb, hb2 = W_up * xb
         gemv_q4_0_arena(
             arena,
             weights.w_gate,
@@ -477,10 +472,8 @@ impl TransformerLayer {
             dim,
         );
 
-        // 8. Fused JIT SwiGLU: hb_act = silu(hb) * hb2
         engine.exec_binary(self.swiglu_fn, arena, ws.hb, ws.hb2, ws.hb_act);
 
-        // 9. FFN Down Projection: xb = W_down * hb_act, then JIT Residual Add: x = x_mid + xb
         gemv_q4_0_arena(
             arena,
             weights.w_down,
@@ -524,7 +517,6 @@ impl TransformerLayer {
         let hb2_b = bws.hb2_batch.subslice(0, batch_size * hidden_dim);
         let hb_act_b = bws.hb_act_batch.subslice(0, batch_size * hidden_dim);
 
-        // 1. Pre-Attention JIT RMSNorm for each token in the batch
         for b in 0..batch_size {
             engine.exec_with_weights(
                 self.rmsnorm_fn,
@@ -535,13 +527,8 @@ impl TransformerLayer {
             );
         }
 
-        // 2. Batched QKV Projections via gemm_q4_0_arena
-        let k_batch = kv
-            .k_cache
-            .subslice(start_pos * kv_dim, batch_size * kv_dim);
-        let v_batch = kv
-            .v_cache
-            .subslice(start_pos * kv_dim, batch_size * kv_dim);
+        let k_batch = kv.k_cache.subslice(start_pos * kv_dim, batch_size * kv_dim);
+        let v_batch = kv.v_cache.subslice(start_pos * kv_dim, batch_size * kv_dim);
         gemm_q4_0_arena(
             arena,
             weights.wq,
@@ -573,7 +560,6 @@ impl TransformerLayer {
             dim,
         );
 
-        // 3 & 4. Apply cached RoPE and causal GQA attention per position in the batch
         for b in 0..batch_size {
             let pos = start_pos + b;
             let q_pos = q_b.subslice(b * dim, dim);
@@ -606,7 +592,6 @@ impl TransformerLayer {
             }
         }
 
-        // 5. Batched Output Projection via gemm_q4_0_arena + Batched JIT Residual Add
         gemm_q4_0_arena(
             arena,
             weights.wo,
@@ -619,7 +604,6 @@ impl TransformerLayer {
         );
         engine.exec_binary(self.residual_add_fn, arena, x_b, xb2_b, x_mid_b);
 
-        // 6. Pre-FFN JIT RMSNorm per token
         for b in 0..batch_size {
             engine.exec_with_weights(
                 self.rmsnorm_fn,
@@ -630,7 +614,6 @@ impl TransformerLayer {
             );
         }
 
-        // 7. Batched FFN Gate & Up Projections via gemm_q4_0_arena
         gemm_q4_0_arena(
             arena,
             weights.w_gate,
@@ -652,10 +635,8 @@ impl TransformerLayer {
             dim,
         );
 
-        // 8. Batched Fused JIT SwiGLU across all `batch_size * hidden_dim` elements
         engine.exec_binary(self.swiglu_fn, arena, hb_b, hb2_b, hb_act_b);
 
-        // 9. Batched FFN Down Projection via gemm_q4_0_arena + Batched JIT Residual Add
         gemm_q4_0_arena(
             arena,
             weights.w_down,
@@ -773,7 +754,10 @@ impl TransformerModel {
     ) -> usize {
         let dim = self.layer.config.dim;
         let blocks_per_row = dim / QK4_0;
-        assert!(token_id < self.vocab_size, "token_id out of vocabulary bounds");
+        assert!(
+            token_id < self.vocab_size,
+            "token_id out of vocabulary bounds"
+        );
         assert_eq!(weights.vocab_size, self.vocab_size, "vocab_size mismatch");
         assert_eq!(
             weights.layers.len(),
@@ -781,17 +765,14 @@ impl TransformerModel {
             "layer count mismatch"
         );
 
-        // 1. Dequantize token embedding row directly into workspace `x`
         let embd_row =
             &weights.token_embd[token_id * blocks_per_row..(token_id + 1) * blocks_per_row];
         dequantize_row_q4_0(embd_row, arena.get_mut(self.layer.workspace.x));
 
-        // 2. Execute all L Transformer layers
         for (lw, kv) in weights.layers.iter().zip(self.kv_caches.iter()) {
             self.layer.forward_token_with_kv(engine, arena, lw, kv, pos);
         }
 
-        // 3. Final output RMSNorm: xb = rmsnorm(x, output_norm)
         engine.exec_with_weights(
             self.layer.rmsnorm_fn,
             arena,
@@ -800,7 +781,6 @@ impl TransformerModel {
             self.layer.workspace.xb,
         );
 
-        // 4. Classifier LM Head GEMV: logits = lm_head * xb
         gemv_q4_0_arena(
             arena,
             weights.lm_head,
@@ -811,7 +791,6 @@ impl TransformerModel {
             dim,
         );
 
-        // 5. Greedy argmax token selection
         sample_argmax(arena.get(self.logits))
     }
 
@@ -964,7 +943,6 @@ impl TransformerModel {
             }
         }
 
-        // Apply JIT-compiled 2-pass L2 normalization: embed_norm = embed_accum / ||embed_accum||_2
         engine.exec_unary(self.l2_norm_fn, arena, self.embed_accum, self.embed_norm);
         out_embedding.copy_from_slice(arena.get(self.embed_norm));
     }
@@ -1067,7 +1045,6 @@ mod tests {
         for pos in 0..4 {
             layer.forward_token(&engine, &mut arena, &weights, pos);
 
-            // Scalar reference step
             let xb = scalar_rmsnorm(&ref_x, &rms_att_w, cfg.rms_eps);
             let mut q = scalar_gemv(&wq, &xb, cfg.dim, cfg.dim);
             let mut k = scalar_gemv(&wk, &xb, cfg.dim, cfg.dim);
@@ -1091,7 +1068,11 @@ mod tests {
             );
 
             let wo_out = scalar_gemv(&wo, &att_out, cfg.dim, cfg.dim);
-            let x_mid: Vec<f32> = ref_x.iter().zip(wo_out.iter()).map(|(a, b)| a + b).collect();
+            let x_mid: Vec<f32> = ref_x
+                .iter()
+                .zip(wo_out.iter())
+                .map(|(a, b)| a + b)
+                .collect();
 
             let ffn_in = scalar_rmsnorm(&x_mid, &rms_ffn_w, cfg.rms_eps);
             let gate = scalar_gemv(&w_gate, &ffn_in, cfg.hidden_dim, cfg.dim);
@@ -1196,7 +1177,11 @@ mod tests {
             );
 
             let wo_out = scalar_gemv(&wo, &att_out, cfg.dim, cfg.dim);
-            let x_mid: Vec<f32> = ref_x.iter().zip(wo_out.iter()).map(|(a, b)| a + b).collect();
+            let x_mid: Vec<f32> = ref_x
+                .iter()
+                .zip(wo_out.iter())
+                .map(|(a, b)| a + b)
+                .collect();
 
             let ffn_in = scalar_rmsnorm(&x_mid, &rms_ffn_w, cfg.rms_eps);
             let gate = scalar_gemv(&w_gate, &ffn_in, cfg.hidden_dim, cfg.dim);
@@ -1273,7 +1258,8 @@ mod tests {
         let ops_after = current_thread_heap_ops();
 
         assert_eq!(
-            ops_after, ops_before,
+            ops_after,
+            ops_before,
             "Expected 0 heap allocs/deallocs during Transformer token generation loop, found {:?}",
             (ops_after.0 - ops_before.0, ops_after.1 - ops_before.1)
         );
@@ -1328,17 +1314,16 @@ mod tests {
 
         let prompt = [1usize, 7, 19, 42];
 
-        // 1. Sequential token-by-token reference
         let mut engine_seq = JitEngine::new();
         let mut arena_seq = AlignedArena::with_capacity(131072);
         let model_seq =
             TransformerModel::new(&mut engine_seq, &mut arena_seq, cfg, num_layers, vocab_size);
         let mut seq_next = 0;
         for (pos, &tok) in prompt.iter().enumerate() {
-            seq_next = model_seq.forward_token(&engine_seq, &mut arena_seq, &model_weights, tok, pos);
+            seq_next =
+                model_seq.forward_token(&engine_seq, &mut arena_seq, &model_weights, tok, pos);
         }
 
-        // 2. Batched GEMM prefill + generate
         let mut engine_batch = JitEngine::new();
         let mut arena_batch = AlignedArena::with_capacity(131072);
         let model_batch = TransformerModel::new(

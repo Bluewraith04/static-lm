@@ -26,7 +26,10 @@ impl ArenaSlice {
 
     #[inline(always)]
     pub const fn subslice(&self, rel_offset: usize, len: usize) -> ArenaSlice {
-        assert!(rel_offset + len <= self.len, "ArenaSlice::subslice out of bounds");
+        assert!(
+            rel_offset + len <= self.len,
+            "ArenaSlice::subslice out of bounds"
+        );
         ArenaSlice {
             offset: self.offset + rel_offset,
             len,
@@ -56,8 +59,8 @@ impl AlignedArena {
         let byte_size = aligned_cap
             .checked_mul(std::mem::size_of::<f32>())
             .expect("arena byte size overflow");
-        let layout = Layout::from_size_align(byte_size, ARENA_ALIGN)
-            .expect("invalid arena memory layout");
+        let layout =
+            Layout::from_size_align(byte_size, ARENA_ALIGN).expect("invalid arena memory layout");
 
         // SAFETY: byte_size > 0 and ARENA_ALIGN is a power of two.
         let raw_ptr = unsafe { alloc_zeroed(layout) as *mut f32 };
@@ -397,7 +400,6 @@ pub(crate) mod tests {
         let blocks_per_row = dim / QK4_0;
         let blocks_per_layer = dim * blocks_per_row;
 
-        // Pre-allocate and quantize 4 layer matrices
         let mut layers = Vec::with_capacity(num_layers);
         for layer_idx in 0..num_layers {
             let f32_weights: Vec<f32> = (0..(dim * dim))
@@ -410,7 +412,6 @@ pub(crate) mod tests {
 
         let init_input: Vec<f32> = (0..dim).map(|i| ((i as f32) * 0.03).cos()).collect();
 
-        // Pre-allocate static activation arena and slices
         let mut arena = AlignedArena::with_capacity(1024);
         let ping = arena.alloc_slice(dim);
         let pong = arena.alloc_slice(dim);
@@ -418,10 +419,8 @@ pub(crate) mod tests {
 
         arena.get_mut(ping).copy_from_slice(&init_input);
 
-        // Warm up TLS counter and snapshot heap operation counts before the hot loop
         let ops_before = current_thread_heap_ops();
 
-        // Execute 10 tokens x 4-layer GEMV forward pass strictly inside the arena
         for _step in 0..10 {
             gemv_q4_0_arena(&mut arena, &layers[0], ping, q8_scratch, pong, dim, dim);
             gemv_q4_0_arena(&mut arena, &layers[1], pong, q8_scratch, ping, dim, dim);
@@ -431,12 +430,12 @@ pub(crate) mod tests {
 
         let ops_after = current_thread_heap_ops();
         assert_eq!(
-            ops_after, ops_before,
+            ops_after,
+            ops_before,
             "Expected 0 heap allocs/deallocs during hot GEMV loop, found {:?}",
             (ops_after.0 - ops_before.0, ops_after.1 - ops_before.1)
         );
 
-        // Verify numerical equivalence against a standalone reference pass for 1 full 4-layer step
         arena.get_mut(ping).copy_from_slice(&init_input);
         gemv_q4_0_arena(&mut arena, &layers[0], ping, q8_scratch, pong, dim, dim);
         gemv_q4_0_arena(&mut arena, &layers[1], pong, q8_scratch, ping, dim, dim);

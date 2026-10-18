@@ -38,7 +38,7 @@ fn scalar_residual_add(a: &[f32], b: &[f32], out: &mut [f32]) {
     }
 }
 
-/// Comparative benchmark metrics for Application 1: Local `.gguf` Text Generation (`generate`).
+/// Benchmark metrics for text generation.
 #[derive(Clone, Debug)]
 pub struct GenerateBenchMetrics {
     pub engine_name: &'static str,
@@ -57,7 +57,7 @@ pub struct GenerateBenchMetrics {
     pub output_tokens: Vec<usize>,
 }
 
-/// Comparative benchmark metrics for Application 2: Semantic Embedding & Cosine Search (`embed`).
+/// Benchmark metrics for embedding extraction and cosine search.
 #[derive(Clone, Debug)]
 pub struct EmbedBenchMetrics {
     pub engine_name: &'static str,
@@ -94,8 +94,13 @@ fn argmax_f32(slice: &[f32]) -> usize {
 fn q4_model_weight_bytes(weights: &ModelWeights<'_>) -> usize {
     let mut blocks = weights.token_embd.len() + weights.lm_head.len();
     for l in &weights.layers {
-        blocks +=
-            l.wq.len() + l.wk.len() + l.wv.len() + l.wo.len() + l.w_gate.len() + l.w_up.len() + l.w_down.len();
+        blocks += l.wq.len()
+            + l.wk.len()
+            + l.wv.len()
+            + l.wo.len()
+            + l.w_gate.len()
+            + l.w_up.len()
+            + l.w_down.len();
     }
     let norm_floats = weights.output_norm.len()
         + weights
@@ -107,7 +112,7 @@ fn q4_model_weight_bytes(weights: &ModelWeights<'_>) -> usize {
 }
 
 // ============================================================================
-// Baseline 1A & 2A: `candle`-style / `fastembed`-style Heap-Allocating Tensor Engine
+// Heap-allocating tensor baseline (candle-style)
 // ============================================================================
 
 struct HeapKvCache {
@@ -205,7 +210,7 @@ fn heap_forward_hidden(
 }
 
 // ============================================================================
-// Baseline 1B & 2B: `llama2.c`-style Pre-Allocated `f32` RunState Engine
+// Pre-allocated f32 baseline (llama2.c-style)
 // ============================================================================
 
 struct F32LayerWeights {
@@ -259,8 +264,7 @@ impl F32ModelWeights {
     }
 
     fn total_bytes(&self) -> usize {
-        let mut floats =
-            self.token_embd.len() + self.output_norm.len() + self.lm_head.len();
+        let mut floats = self.token_embd.len() + self.output_norm.len() + self.lm_head.len();
         for l in &self.layers {
             floats += l.rms_att.len()
                 + l.wq.len()
@@ -405,7 +409,13 @@ fn f32_forward_hidden(
         f32_matmul_vec(&lw.w_gate, &state.xb, &mut state.hb, cfg.hidden_dim, dim);
         f32_matmul_vec(&lw.w_up, &state.xb, &mut state.hb2, cfg.hidden_dim, dim);
         scalar_swiglu(&state.hb, &state.hb2, &mut state.hb_act);
-        f32_matmul_vec(&lw.w_down, &state.hb_act, &mut state.xb, dim, cfg.hidden_dim);
+        f32_matmul_vec(
+            &lw.w_down,
+            &state.hb_act,
+            &mut state.xb,
+            dim,
+            cfg.hidden_dim,
+        );
         scalar_residual_add(&state.x_mid, &state.xb, &mut state.x);
     }
 
@@ -413,7 +423,7 @@ fn f32_forward_hidden(
 }
 
 // ============================================================================
-// Baseline 1C & 2C: Unbatched Scalar Quantized Engine (No SIMD, No JIT, No GEMM)
+// Unbatched scalar quantized baseline
 // ============================================================================
 
 fn scalar_gemv_q4_0_arena(
@@ -536,7 +546,7 @@ fn scalar_quant_forward_hidden(
 // Public Comparative Benchmark Runners
 // ============================================================================
 
-/// Runs Application 1 (`generate`) across `static-lm` and 3 competing baselines on the same model and prompt.
+/// Benchmarks text generation across `static-lm` and three in-tree baselines on the same model and prompt.
 pub fn run_generate_comparative_bench(
     engine: &JitEngine,
     model: &TransformerModel,
@@ -552,7 +562,7 @@ pub fn run_generate_comparative_bench(
     let q4_weight_bytes = q4_model_weight_bytes(weights);
     let arena_used_bytes = arena.used_floats_or_bytes(cfg, num_layers, weights.vocab_size);
 
-    // 1. static-lm (Ours: Pre-allocated Arena + Batched GEMM Prefill + SIMD Q4xQ8 + Cranelift JIT)
+    // static-lm
     let mut static_out = vec![0usize; num_decode_tokens];
     let (a0, _, b0) = current_thread_heap_stats();
     let mut prefill_dur = 0.0f64;
@@ -576,7 +586,7 @@ pub fn run_generate_comparative_bench(
     let static_decode_ms = decode_dur / (iters as f64);
     let static_total_ms = static_prefill_ms + static_decode_ms;
 
-    // 2. Baseline 1A: `candle`-style Heap Tensor Engine (per-op Vec<f32> allocs + Q4->f32 dequant)
+    // Heap-allocating tensor baseline
     let mut heap_kv: Vec<HeapKvCache> = (0..num_layers)
         .map(|_| HeapKvCache {
             k: vec![0.0; cfg.max_seq_len * cfg.kv_dim()],
@@ -593,7 +603,8 @@ pub fn run_generate_comparative_bench(
         for (pos, &tok) in prompt_tokens.iter().enumerate() {
             last_hidden = heap_forward_hidden(cfg, weights, &mut heap_kv, tok, pos);
         }
-        let logits = heap_matmul_q4_dequant(weights.lm_head, &last_hidden, weights.vocab_size, cfg.dim);
+        let logits =
+            heap_matmul_q4_dequant(weights.lm_head, &last_hidden, weights.vocab_size, cfg.dim);
         let mut next_tok = argmax_f32(&logits);
         let t1 = Instant::now();
         b1a_out[0] = next_tok;
@@ -614,7 +625,7 @@ pub fn run_generate_comparative_bench(
     let b1a_decode_ms = b1a_decode / (iters as f64);
     let b1a_total_ms = b1a_prefill_ms + b1a_decode_ms;
 
-    // 3. Baseline 1B: `llama2.c`-style Pre-Allocated `f32` RunState Engine
+    // Pre-allocated f32 baseline
     let f32_weights = F32ModelWeights::from_q4(weights, cfg);
     let mut f32_state = F32RunState::new(cfg, num_layers, weights.vocab_size);
     let mut b1b_out = vec![0usize; num_decode_tokens];
@@ -658,7 +669,7 @@ pub fn run_generate_comparative_bench(
     let b1b_decode_ms = b1b_decode / (iters as f64);
     let b1b_total_ms = b1b_prefill_ms + b1b_decode_ms;
 
-    // 4. Baseline 1C: Unbatched Scalar Quantized Engine (No GEMM prefill, No SIMD, No JIT)
+    // Unbatched scalar quantized baseline
     let mut b1c_out = vec![0usize; num_decode_tokens];
     let (s_a0, _, s_b0) = current_thread_heap_stats();
     let mut b1c_prefill = 0.0f64;
@@ -725,7 +736,7 @@ pub fn run_generate_comparative_bench(
 
     [
         GenerateBenchMetrics {
-            engine_name: "static-lm (Ours)",
+            engine_name: "static-lm",
             arch_summary: "Arena + Batch GEMM + SIMD Q4xQ8 + Cranelift JIT",
             prompt_tokens: prompt_tokens.len(),
             generated_tokens: num_decode_tokens,
@@ -741,7 +752,7 @@ pub fn run_generate_comparative_bench(
             output_tokens: static_out,
         },
         GenerateBenchMetrics {
-            engine_name: "Baseline 1A (candle-style)",
+            engine_name: "heap tensors (candle-style)",
             arch_summary: "Heap Vec<f32> Tensors + On-the-Fly Q4 Dequant",
             prompt_tokens: prompt_tokens.len(),
             generated_tokens: num_decode_tokens,
@@ -761,7 +772,7 @@ pub fn run_generate_comparative_bench(
             output_tokens: b1a_out,
         },
         GenerateBenchMetrics {
-            engine_name: "Baseline 1B (llama2.c-style)",
+            engine_name: "static f32 (llama2.c-style)",
             arch_summary: "Static f32 RunState + Pre-Dequantized f32 GEMV",
             prompt_tokens: prompt_tokens.len(),
             generated_tokens: num_decode_tokens,
@@ -777,7 +788,7 @@ pub fn run_generate_comparative_bench(
             output_tokens: b1b_out,
         },
         GenerateBenchMetrics {
-            engine_name: "Baseline 1C (Unfused Q4)",
+            engine_name: "unfused scalar Q4",
             arch_summary: "Sequential Scalar Q4xQ8 + Unfused Scalar Ops",
             prompt_tokens: prompt_tokens.len(),
             generated_tokens: num_decode_tokens,
@@ -795,7 +806,7 @@ pub fn run_generate_comparative_bench(
     ]
 }
 
-/// Runs Application 2 (`embed`) across `static-lm` and 3 competing baselines on the same corpus and query.
+/// Benchmarks embedding and cosine search across `static-lm` and three in-tree baselines on the same corpus and query.
 pub fn run_embed_comparative_bench(
     engine: &JitEngine,
     model: &TransformerModel,
@@ -810,12 +821,11 @@ pub fn run_embed_comparative_bench(
     let dim = cfg.dim;
     let num_layers = model.kv_caches.len();
     let num_docs = doc_tokens.len();
-    let total_tokens: usize =
-        doc_tokens.iter().map(Vec::len).sum::<usize>() + query_tokens.len();
+    let total_tokens: usize = doc_tokens.iter().map(Vec::len).sum::<usize>() + query_tokens.len();
     let q4_weight_bytes = q4_model_weight_bytes(weights);
     let arena_used_bytes = arena.used_floats_or_bytes(cfg, num_layers, weights.vocab_size);
 
-    // 1. static-lm (Ours: In-Arena Streaming Mean Pool + Cranelift JIT 2-Pass L2 Norm + In-Place Rank)
+    // static-lm
     let mut static_doc_embs = vec![0.0f32; num_docs * dim];
     let mut static_q_emb = vec![0.0f32; dim];
     let mut static_scores = vec![(0usize, 0.0f32); num_docs];
@@ -838,7 +848,7 @@ pub fn run_embed_comparative_bench(
     let static_ms = t0.elapsed().as_secs_f64() * 1000.0 / (iters as f64);
     let (a1, _, b1) = current_thread_heap_stats();
 
-    // 2. Baseline 2A: `fastembed`/`candle`-style Heap Tensor Pipeline
+    // Heap-allocating tensor baseline
     let mut heap_kv: Vec<HeapKvCache> = (0..num_layers)
         .map(|_| HeapKvCache {
             k: vec![0.0; cfg.max_seq_len * cfg.kv_dim()],
@@ -889,16 +899,14 @@ pub fn run_embed_comparative_bench(
     let b2a_ms = t_2a.elapsed().as_secs_f64() * 1000.0 / (iters as f64);
     let (h_a1, _, h_b1) = current_thread_heap_stats();
 
-    // 3. Baseline 2B: `llama2.c`-style Static `f32` Embedder
+    // Pre-allocated f32 baseline
     let f32_weights = F32ModelWeights::from_q4(weights, cfg);
     let mut f32_state = F32RunState::new(cfg, num_layers, weights.vocab_size);
     let mut b2b_doc_embs = vec![0.0f32; num_docs * dim];
     let mut b2b_q_emb = vec![0.0f32; dim];
     let mut b2b_scores = vec![(0usize, 0.0f32); num_docs];
 
-    let f32_embed_seq = |toks: &[usize],
-                         state: &mut F32RunState,
-                         out_emb: &mut [f32]| {
+    let f32_embed_seq = |toks: &[usize], state: &mut F32RunState, out_emb: &mut [f32]| {
         state.embed_pool.fill(0.0);
         for (pos, &tok) in toks.iter().enumerate() {
             f32_forward_hidden(cfg, &f32_weights, state, tok, pos);
@@ -934,40 +942,39 @@ pub fn run_embed_comparative_bench(
     let b2b_ms = t_2b.elapsed().as_secs_f64() * 1000.0 / (iters as f64);
     let (f_a1, _, f_b1) = current_thread_heap_stats();
 
-    // 4. Baseline 2C: Unfused Scalar Quantized Embedder (No JIT l2_norm / No SIMD)
+    // Unbatched scalar quantized baseline
     let mut b2c_doc_embs = vec![0.0f32; num_docs * dim];
     let mut b2c_q_emb = vec![0.0f32; dim];
     let mut b2c_scores = vec![(0usize, 0.0f32); num_docs];
 
-    let scalar_quant_embed_seq =
-        |toks: &[usize], arena: &mut AlignedArena, out_emb: &mut [f32]| {
-            arena.get_mut(model.embed_accum).fill(0.0);
-            for (pos, &tok) in toks.iter().enumerate() {
-                scalar_quant_forward_hidden(
-                    cfg,
-                    &model.layer.workspace,
-                    &model.kv_caches,
-                    arena,
-                    weights,
-                    tok,
-                    pos,
-                );
-                let (xb_s, pool_mut) = arena.io_slices(model.layer.workspace.xb, model.embed_accum);
-                for (dst, &val) in pool_mut.iter_mut().zip(xb_s.iter()) {
-                    *dst += val;
-                }
+    let scalar_quant_embed_seq = |toks: &[usize], arena: &mut AlignedArena, out_emb: &mut [f32]| {
+        arena.get_mut(model.embed_accum).fill(0.0);
+        for (pos, &tok) in toks.iter().enumerate() {
+            scalar_quant_forward_hidden(
+                cfg,
+                &model.layer.workspace,
+                &model.kv_caches,
+                arena,
+                weights,
+                tok,
+                pos,
+            );
+            let (xb_s, pool_mut) = arena.io_slices(model.layer.workspace.xb, model.embed_accum);
+            for (dst, &val) in pool_mut.iter_mut().zip(xb_s.iter()) {
+                *dst += val;
             }
-            let inv_len = 1.0f32 / (toks.len() as f32);
-            let mut sum_sq = 0.0f32;
-            for v in arena.get_mut(model.embed_accum).iter_mut() {
-                *v *= inv_len;
-                sum_sq += *v * *v;
-            }
-            let inv_norm = 1.0f32 / (sum_sq + cfg.rms_eps).sqrt();
-            for (dst, &v) in out_emb.iter_mut().zip(arena.get(model.embed_accum).iter()) {
-                *dst = v * inv_norm;
-            }
-        };
+        }
+        let inv_len = 1.0f32 / (toks.len() as f32);
+        let mut sum_sq = 0.0f32;
+        for v in arena.get_mut(model.embed_accum).iter_mut() {
+            *v *= inv_len;
+            sum_sq += *v * *v;
+        }
+        let inv_norm = 1.0f32 / (sum_sq + cfg.rms_eps).sqrt();
+        for (dst, &v) in out_emb.iter_mut().zip(arena.get(model.embed_accum).iter()) {
+            *dst = v * inv_norm;
+        }
+    };
 
     let (s_a0, _, s_b0) = current_thread_heap_stats();
     let t_2c = Instant::now();
@@ -986,7 +993,7 @@ pub fn run_embed_comparative_bench(
 
     [
         EmbedBenchMetrics {
-            engine_name: "static-lm (Ours)",
+            engine_name: "static-lm",
             arch_summary: "In-Arena Mean Pool + Cranelift JIT 2-Pass L2 Norm",
             num_docs,
             total_tokens,
@@ -1003,7 +1010,7 @@ pub fn run_embed_comparative_bench(
             ranking: static_scores,
         },
         EmbedBenchMetrics {
-            engine_name: "Baseline 2A (fastembed/candle)",
+            engine_name: "heap tensors (candle-style)",
             arch_summary: "Heap Vec<Vec<f32>> Pooling + Heap L2 Norm & Sort",
             num_docs,
             total_tokens,
@@ -1024,7 +1031,7 @@ pub fn run_embed_comparative_bench(
             ranking: b2a_scores,
         },
         EmbedBenchMetrics {
-            engine_name: "Baseline 2B (llama2.c-style)",
+            engine_name: "static f32 (llama2.c-style)",
             arch_summary: "Static f32 RunState + Scalar 2-Pass L2 Norm",
             num_docs,
             total_tokens,
@@ -1041,7 +1048,7 @@ pub fn run_embed_comparative_bench(
             ranking: b2b_scores,
         },
         EmbedBenchMetrics {
-            engine_name: "Baseline 2C (Unfused Q4)",
+            engine_name: "unfused scalar Q4",
             arch_summary: "Scalar Q4xQ8 Forward + Unfused Scalar L2 Norm",
             num_docs,
             total_tokens,
@@ -1086,15 +1093,15 @@ impl ArenaFootprintExt for AlignedArena {
     }
 }
 
-/// Prints a formatted ASCII comparative table for Application 1 (`generate`).
+/// Prints the text generation benchmark table.
 pub fn print_generate_bench_table(results: &[GenerateBenchMetrics; 4]) {
     println!(
-        "\n=== Application 1 Comparative Benchmark: Text Generation (prompt={} toks, gen={} toks) ===",
+        "\n=== Text generation (prompt={} toks, gen={} toks) ===",
         results[0].prompt_tokens, results[0].generated_tokens
     );
     println!(
         "{:<29} | {:>11} | {:>11} | {:>9} | {:>8} | {:>10} | {:>10} | {:>10}",
-        "Engine / Baseline",
+        "Engine",
         "Prefill t/s",
         "Decode t/s",
         "Total ms",
@@ -1119,15 +1126,15 @@ pub fn print_generate_bench_table(results: &[GenerateBenchMetrics; 4]) {
     }
 }
 
-/// Prints a formatted ASCII comparative table for Application 2 (`embed`).
+/// Prints the embedding benchmark table.
 pub fn print_embed_bench_table(results: &[EmbedBenchMetrics; 4]) {
     println!(
-        "\n=== Application 2 Comparative Benchmark: Semantic Embedding & Search (docs={}, total_toks={}) ===",
+        "\n=== Embedding and search (docs={}, total_toks={}) ===",
         results[0].num_docs, results[0].total_tokens
     );
     println!(
         "{:<29} | {:>11} | {:>11} | {:>9} | {:>8} | {:>10} | {:>10} | {:>10}",
-        "Engine / Baseline",
+        "Engine",
         "Embed doc/s",
         "Embed tok/s",
         "Total ms",
@@ -1155,9 +1162,9 @@ pub fn print_embed_bench_table(results: &[EmbedBenchMetrics; 4]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytemuck::Zeroable;
     use crate::model::transformer::TransformerWeights;
     use crate::quant::blocks::quantize_row_q4_0;
+    use bytemuck::Zeroable;
 
     fn pseudo_random_f32(len: usize, mut seed: u32) -> Vec<f32> {
         let mut out = Vec::with_capacity(len);
@@ -1225,38 +1232,59 @@ mod tests {
         let mut arena = AlignedArena::with_capacity(512 * 1024);
         let model = TransformerModel::new(&mut engine, &mut arena, cfg, 1, vocab_size);
 
-        // 1. Test Application 1 (`generate`) Comparative Harness
         let prompt = [1usize, 5, 9, 13];
-        let gen_results =
-            run_generate_comparative_bench(&engine, &model, &mut arena, &model_weights, &prompt, 4, 1);
+        let gen_results = run_generate_comparative_bench(
+            &engine,
+            &model,
+            &mut arena,
+            &model_weights,
+            &prompt,
+            4,
+            1,
+        );
 
-        // Verify zero heap allocations for static-lm, Baseline 1B (llama2.c-style), and Baseline 1C
-        assert_eq!(gen_results[0].heap_allocs, 0, "static-lm must have 0 heap allocs");
-        assert_eq!(gen_results[0].heap_bytes, 0, "static-lm must allocate 0 heap bytes");
+        // zero-allocation engines
+        assert_eq!(
+            gen_results[0].heap_allocs, 0,
+            "static-lm must have 0 heap allocs"
+        );
+        assert_eq!(
+            gen_results[0].heap_bytes, 0,
+            "static-lm must allocate 0 heap bytes"
+        );
         assert!(
             gen_results[1].heap_allocs > 50,
-            "Baseline 1A (candle-style) must allocate heap tensors per op"
+            "heap-tensor baseline must allocate heap tensors per op"
         );
         assert!(gen_results[1].heap_bytes > 4096);
-        assert_eq!(gen_results[2].heap_allocs, 0, "Baseline 1B (llama2.c-style) has 0 runtime allocs");
-        assert_eq!(gen_results[3].heap_allocs, 0, "Baseline 1C has 0 runtime allocs");
+        assert_eq!(
+            gen_results[2].heap_allocs, 0,
+            "static f32 baseline has 0 runtime allocs"
+        );
+        assert_eq!(
+            gen_results[3].heap_allocs, 0,
+            "scalar quantized baseline has 0 runtime allocs"
+        );
         assert!(
             gen_results[2].static_memory_bytes > gen_results[0].static_memory_bytes,
-            "Baseline 1B f32 weights must consume more static memory than Q4_0 static-lm"
+            "static f32 weights must consume more static memory than Q4_0 static-lm"
         );
 
-        // Verify exact generated token parity between static-lm and quantized Baseline 1C
+        // token parity between engines with identical numerics
         assert_eq!(
             gen_results[0].output_tokens, gen_results[3].output_tokens,
-            "static-lm and Baseline 1C must generate identical tokens"
+            "static-lm and scalar quantized baseline must generate identical tokens"
         );
         assert_eq!(
             gen_results[1].output_tokens, gen_results[2].output_tokens,
-            "Baseline 1A and 1B (dequantized f32) must generate identical tokens"
+            "heap-tensor and static f32 baselines must generate identical tokens"
         );
 
-        // 2. Test Application 2 (`embed`) Comparative Harness
-        let docs = vec![vec![1usize, 2, 3, 4], vec![10usize, 20, 30, 40], vec![1usize, 2, 3, 4]];
+        let docs = vec![
+            vec![1usize, 2, 3, 4],
+            vec![10usize, 20, 30, 40],
+            vec![1usize, 2, 3, 4],
+        ];
         let query = [1usize, 2, 3, 4];
         let embed_results = run_embed_comparative_bench(
             &engine,
@@ -1268,11 +1296,17 @@ mod tests {
             1,
         );
 
-        assert_eq!(embed_results[0].heap_allocs, 0, "static-lm embed must have 0 heap allocs");
-        assert_eq!(embed_results[0].heap_bytes, 0, "static-lm embed must allocate 0 heap bytes");
+        assert_eq!(
+            embed_results[0].heap_allocs, 0,
+            "static-lm embed must have 0 heap allocs"
+        );
+        assert_eq!(
+            embed_results[0].heap_bytes, 0,
+            "static-lm embed must allocate 0 heap bytes"
+        );
         assert!(
             embed_results[1].heap_allocs > 50,
-            "Baseline 2A (fastembed/candle-style) must allocate heap tensors"
+            "heap-tensor baseline must allocate heap tensors"
         );
         assert_eq!(embed_results[2].heap_allocs, 0);
         assert_eq!(embed_results[3].heap_allocs, 0);

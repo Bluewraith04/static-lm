@@ -266,7 +266,10 @@ mod tests {
         let (kernel, stats) = engine.compile_with_stats(&FuseGraph::rmsnorm(n, eps));
 
         assert_eq!(stats.num_stack_slots, 0, "RMSNorm must not spill to stack");
-        assert!(!stats.has_call_insts, "RMSNorm must not emit external calls");
+        assert!(
+            !stats.has_call_insts,
+            "RMSNorm must not emit external calls"
+        );
         assert_eq!(stats.num_loops, 2, "RMSNorm must lower to a 2-pass loop");
         assert_eq!(
             stats.final_loop_sqrt_or_div, 0,
@@ -305,7 +308,10 @@ mod tests {
         let (softmax_fn, stats) = engine.compile_with_stats(&FuseGraph::softmax());
 
         assert_eq!(stats.num_stack_slots, 0, "Softmax must not spill to stack");
-        assert!(!stats.has_call_insts, "Softmax must not emit external calls");
+        assert!(
+            !stats.has_call_insts,
+            "Softmax must not emit external calls"
+        );
         assert_eq!(
             stats.num_loops, 3,
             "Softmax (ReduceMax + ReduceSum + Normalize) must lower to 3 loops"
@@ -333,7 +339,6 @@ mod tests {
             );
         }
 
-        // Test remaining primitive ops: Neg, Sub, Div, Sqrt, Recip
         let mut g = FuseGraph::new();
         let a = g.load(InputId(0));
         let b = g.load(InputId(1));
@@ -402,7 +407,8 @@ mod tests {
 
         let ops_after = current_thread_heap_ops();
         assert_eq!(
-            ops_after, ops_before,
+            ops_after,
+            ops_before,
             "Expected 0 heap allocs/deallocs on JIT cache hit and exec_* calls, found {:?}",
             (ops_after.0 - ops_before.0, ops_after.1 - ops_before.1)
         );
@@ -418,7 +424,6 @@ mod tests {
             let a = pseudo_random_f32(len, 0x1111_2222 ^ (len as u32));
             let b = pseudo_random_f32(len, 0x3333_4444 ^ (len as u32));
 
-            // 1. SwiGLU with guard sentinel at index `len` to verify no out-of-bounds write
             let mut out_swiglu = vec![-999.0f32; len + 4];
             let inputs_swiglu = [a.as_ptr(), b.as_ptr()];
             unsafe {
@@ -437,7 +442,6 @@ mod tests {
                 "Tail loop overwrote past len={len}"
             );
 
-            // 2. Softmax
             let mut out_softmax = vec![-999.0f32; len + 4];
             let inputs_softmax = [a.as_ptr()];
             unsafe {
@@ -458,7 +462,6 @@ mod tests {
                 "Softmax tail loop overwrote past len={len}"
             );
 
-            // 3. RMSNorm
             let eps = 1e-5f32;
             let k_rmsnorm = engine.compile(&FuseGraph::rmsnorm(len, eps));
             let mut out_rms = vec![-999.0f32; len + 4];

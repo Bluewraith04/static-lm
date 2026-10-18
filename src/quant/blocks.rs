@@ -180,13 +180,15 @@ mod tests {
 
         for (&orig, &rec) in input.iter().zip(reconstructed.iter()) {
             let diff = (orig - rec).abs();
-            assert!(diff <= 0.005, "Q8_0 roundtrip diff too high: {diff} ({orig} vs {rec})");
+            assert!(
+                diff <= 0.005,
+                "Q8_0 roundtrip diff too high: {diff} ({orig} vs {rec})"
+            );
         }
     }
 
     #[test]
     fn test_quantize_edge_cases_zero_and_extremes() {
-        // 1. All-zero input must produce 0 scale and reconstruct to exact 0.0
         let zeros = [0.0f32; 64];
         let mut q4 = [BlockQ4_0::zeroed(); 2];
         let mut q8 = [BlockQ8_0::zeroed(); 2];
@@ -203,7 +205,6 @@ mod tests {
         assert!(rec4.iter().all(|&v| v == 0.0));
         assert!(rec8.iter().all(|&v| v == 0.0));
 
-        // 2. Strictly negative and large-magnitude blocks
         let mut neg_block = [0.0f32; 32];
         for (i, v) in neg_block.iter_mut().enumerate() {
             *v = -((i as f32) + 1.0) * 10.0; // [-320.0 .. -10.0]

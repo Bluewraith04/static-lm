@@ -6,22 +6,49 @@ pub struct InputId(pub u8);
 pub struct OutputId(pub u8);
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum UnaryKind { Neg, Exp, Recip, Sqrt, SiLU }
+pub enum UnaryKind {
+    Neg,
+    Exp,
+    Recip,
+    Sqrt,
+    SiLU,
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum BinaryKind { Add, Sub, Mul, Div }
+pub enum BinaryKind {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum ReduceKind { Sum, Max }
+pub enum ReduceKind {
+    Sum,
+    Max,
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum OpNode {
     Load(InputId),
     Const(u32),
-    UnaryOp { op: UnaryKind, src: NodeId },
-    BinaryOp { op: BinaryKind, lhs: NodeId, rhs: NodeId },
-    ReduceOp { op: ReduceKind, src: NodeId },
-    Store { dst: OutputId, src: NodeId },
+    UnaryOp {
+        op: UnaryKind,
+        src: NodeId,
+    },
+    BinaryOp {
+        op: BinaryKind,
+        lhs: NodeId,
+        rhs: NodeId,
+    },
+    ReduceOp {
+        op: ReduceKind,
+        src: NodeId,
+    },
+    Store {
+        dst: OutputId,
+        src: NodeId,
+    },
 }
 
 /// Lightweight SSA expression DAG for elementwise and reduction fusion.
@@ -32,7 +59,9 @@ pub struct FuseGraph {
 }
 
 impl FuseGraph {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     #[inline]
     fn push(&mut self, node: OpNode) -> NodeId {
@@ -46,21 +75,57 @@ impl FuseGraph {
         self.push(OpNode::Load(input))
     }
 
-    pub fn constant(&mut self, val: f32) -> NodeId { self.push(OpNode::Const(val.to_bits())) }
-    pub fn unary(&mut self, op: UnaryKind, src: NodeId) -> NodeId { self.push(OpNode::UnaryOp { op, src }) }
-    pub fn neg(&mut self, src: NodeId) -> NodeId { self.unary(UnaryKind::Neg, src) }
-    pub fn exp(&mut self, src: NodeId) -> NodeId { self.unary(UnaryKind::Exp, src) }
-    pub fn recip(&mut self, src: NodeId) -> NodeId { self.unary(UnaryKind::Recip, src) }
-    pub fn sqrt(&mut self, src: NodeId) -> NodeId { self.unary(UnaryKind::Sqrt, src) }
-    pub fn silu(&mut self, src: NodeId) -> NodeId { self.unary(UnaryKind::SiLU, src) }
-    pub fn binary(&mut self, op: BinaryKind, lhs: NodeId, rhs: NodeId) -> NodeId { self.push(OpNode::BinaryOp { op, lhs, rhs }) }
-    pub fn add(&mut self, lhs: NodeId, rhs: NodeId) -> NodeId { self.binary(BinaryKind::Add, lhs, rhs) }
-    pub fn sub(&mut self, lhs: NodeId, rhs: NodeId) -> NodeId { self.binary(BinaryKind::Sub, lhs, rhs) }
-    pub fn mul(&mut self, lhs: NodeId, rhs: NodeId) -> NodeId { self.binary(BinaryKind::Mul, lhs, rhs) }
-    pub fn div(&mut self, lhs: NodeId, rhs: NodeId) -> NodeId { self.binary(BinaryKind::Div, lhs, rhs) }
-    pub fn reduce_sum(&mut self, src: NodeId) -> NodeId { self.push(OpNode::ReduceOp { op: ReduceKind::Sum, src }) }
-    pub fn reduce_max(&mut self, src: NodeId) -> NodeId { self.push(OpNode::ReduceOp { op: ReduceKind::Max, src }) }
-    pub fn store(&mut self, dst: OutputId, src: NodeId) -> NodeId { self.push(OpNode::Store { dst, src }) }
+    pub fn constant(&mut self, val: f32) -> NodeId {
+        self.push(OpNode::Const(val.to_bits()))
+    }
+    pub fn unary(&mut self, op: UnaryKind, src: NodeId) -> NodeId {
+        self.push(OpNode::UnaryOp { op, src })
+    }
+    pub fn neg(&mut self, src: NodeId) -> NodeId {
+        self.unary(UnaryKind::Neg, src)
+    }
+    pub fn exp(&mut self, src: NodeId) -> NodeId {
+        self.unary(UnaryKind::Exp, src)
+    }
+    pub fn recip(&mut self, src: NodeId) -> NodeId {
+        self.unary(UnaryKind::Recip, src)
+    }
+    pub fn sqrt(&mut self, src: NodeId) -> NodeId {
+        self.unary(UnaryKind::Sqrt, src)
+    }
+    pub fn silu(&mut self, src: NodeId) -> NodeId {
+        self.unary(UnaryKind::SiLU, src)
+    }
+    pub fn binary(&mut self, op: BinaryKind, lhs: NodeId, rhs: NodeId) -> NodeId {
+        self.push(OpNode::BinaryOp { op, lhs, rhs })
+    }
+    pub fn add(&mut self, lhs: NodeId, rhs: NodeId) -> NodeId {
+        self.binary(BinaryKind::Add, lhs, rhs)
+    }
+    pub fn sub(&mut self, lhs: NodeId, rhs: NodeId) -> NodeId {
+        self.binary(BinaryKind::Sub, lhs, rhs)
+    }
+    pub fn mul(&mut self, lhs: NodeId, rhs: NodeId) -> NodeId {
+        self.binary(BinaryKind::Mul, lhs, rhs)
+    }
+    pub fn div(&mut self, lhs: NodeId, rhs: NodeId) -> NodeId {
+        self.binary(BinaryKind::Div, lhs, rhs)
+    }
+    pub fn reduce_sum(&mut self, src: NodeId) -> NodeId {
+        self.push(OpNode::ReduceOp {
+            op: ReduceKind::Sum,
+            src,
+        })
+    }
+    pub fn reduce_max(&mut self, src: NodeId) -> NodeId {
+        self.push(OpNode::ReduceOp {
+            op: ReduceKind::Max,
+            src,
+        })
+    }
+    pub fn store(&mut self, dst: OutputId, src: NodeId) -> NodeId {
+        self.push(OpNode::Store { dst, src })
+    }
 
     /// Single-pass fused SwiGLU graph: `out[i] = silu(gate[i]) * up[i]`.
     pub fn swiglu() -> Self {

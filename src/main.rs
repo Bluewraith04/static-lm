@@ -46,14 +46,84 @@ fn build_synthetic_gguf(path: &std::path::Path, cfg: &TransformerConfig, num_lay
     writer.add_f32("llama.attention.layer_norm_rms_epsilon", cfg.rms_eps);
     writer.add_str("tokenizer.ggml.model", "llama");
 
-    // Build embedded GGUF vocabulary + BPE merge rules
     let base_tokens = [
-        "<unk>", "<s>", "</s>", "▁", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l",
-        "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z", "0", "1", "2", "3",
-        "4", "5", "6", "7", "8", "9", "-", "_", ".", ",", ":", "/", "▁s", "▁st", "▁sta", "▁stat",
-        "▁stati", "▁static", "▁l", "▁lm", "▁g", "▁gg", "▁ggu", "▁gguf", "▁j", "▁ji", "▁jit",
-        "▁m", "▁mm", "▁mma", "▁mmap", "▁a", "▁ar", "▁are", "▁aren", "▁arena", "▁q", "▁q4",
-        "▁q8", "▁q40", "▁si", "▁sim", "▁simd",
+        "<unk>",
+        "<s>",
+        "</s>",
+        "▁",
+        "a",
+        "b",
+        "c",
+        "d",
+        "e",
+        "f",
+        "g",
+        "h",
+        "i",
+        "j",
+        "k",
+        "l",
+        "m",
+        "n",
+        "o",
+        "p",
+        "q",
+        "r",
+        "s",
+        "t",
+        "u",
+        "v",
+        "w",
+        "x",
+        "y",
+        "z",
+        "0",
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8",
+        "9",
+        "-",
+        "_",
+        ".",
+        ",",
+        ":",
+        "/",
+        "▁s",
+        "▁st",
+        "▁sta",
+        "▁stat",
+        "▁stati",
+        "▁static",
+        "▁l",
+        "▁lm",
+        "▁g",
+        "▁gg",
+        "▁ggu",
+        "▁gguf",
+        "▁j",
+        "▁ji",
+        "▁jit",
+        "▁m",
+        "▁mm",
+        "▁mma",
+        "▁mmap",
+        "▁a",
+        "▁ar",
+        "▁are",
+        "▁aren",
+        "▁arena",
+        "▁q",
+        "▁q4",
+        "▁q8",
+        "▁q40",
+        "▁si",
+        "▁sim",
+        "▁simd",
     ];
     let vocab_size = 512usize;
     let mut owned_vocab: Vec<String> = base_tokens.iter().map(|&s| s.to_owned()).collect();
@@ -180,15 +250,17 @@ fn build_synthetic_gguf(path: &std::path::Path, cfg: &TransformerConfig, num_lay
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(String::as_str).unwrap_or("all");
-    let cli_path = if matches!(mode, "bench" | "generate" | "embed" | "all" | "write-synthetic") {
+    let cli_path = if matches!(
+        mode,
+        "bench" | "generate" | "embed" | "all" | "write-synthetic"
+    ) {
         args.get(2).map(PathBuf::from)
     } else {
         args.get(1).map(PathBuf::from)
     };
 
     let is_temp = cli_path.is_none();
-    let gguf_path =
-        cli_path.unwrap_or_else(|| std::env::temp_dir().join("static_lm_bench.gguf"));
+    let gguf_path = cli_path.unwrap_or_else(|| std::env::temp_dir().join("static_lm_bench.gguf"));
 
     if is_temp || mode == "write-synthetic" {
         let default_cfg = TransformerConfig {
@@ -208,9 +280,7 @@ fn main() {
 
     let gguf = GgufFile::open(&gguf_path).expect("failed to open GGUF file");
     let arch = gguf.get_str("general.architecture").unwrap_or("llama");
-    let num_layers = gguf
-        .get_usize(&format!("{arch}.block_count"))
-        .unwrap_or(2);
+    let num_layers = gguf.get_usize(&format!("{arch}.block_count")).unwrap_or(2);
     let num_heads = gguf
         .get_usize(&format!("{arch}.attention.head_count"))
         .unwrap_or(8);
@@ -241,8 +311,8 @@ fn main() {
     let mut engine = JitEngine::new();
     let kv_floats = num_layers * 2 * cfg.max_seq_len * cfg.kv_dim();
     let batch_floats = cfg.max_seq_len * (6 * cfg.dim + 4 * cfg.hidden_dim);
-    let arena_cap =
-        (kv_floats + batch_floats + model_weights.vocab_size * 2 + 1024 * 1024).max(8 * 1024 * 1024);
+    let arena_cap = (kv_floats + batch_floats + model_weights.vocab_size * 2 + 1024 * 1024)
+        .max(8 * 1024 * 1024);
     let mut arena = AlignedArena::with_capacity(arena_cap);
     let model = TransformerModel::new(
         &mut engine,
@@ -319,12 +389,7 @@ fn main() {
 
             println!(
                 "[embed] query={:?} | top_match=doc[{}] ({:?}, cosine={:.4}) | runner_up=doc[{}] (cosine={:.4})",
-                query,
-                scores[0].0,
-                docs[scores[0].0],
-                scores[0].1,
-                scores[1].0,
-                scores[1].1
+                query, scores[0].0, docs[scores[0].0], scores[0].1, scores[1].0, scores[1].1
             );
         }
     }
@@ -396,4 +461,3 @@ fn main() {
         let _ = std::fs::remove_file(&gguf_path);
     }
 }
-
