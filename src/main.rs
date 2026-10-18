@@ -5,6 +5,10 @@ use bytemuck::Zeroable;
 use static_lm::jit::engine::JitEngine;
 use static_lm::memory::arena::AlignedArena;
 use static_lm::memory::loader::{GgufFile, GgufWriter};
+use static_lm::model::bench::{
+    print_embed_bench_table, print_generate_bench_table, run_embed_comparative_bench,
+    run_generate_comparative_bench,
+};
 use static_lm::model::tokenizer::GgufTokenizer;
 use static_lm::model::transformer::{
     TransformerConfig, TransformerModel, rank_documents_by_cosine,
@@ -340,9 +344,41 @@ fn main() {
             "[bench] steps={} | latency: {:.3} ms/tok | throughput: {:.1} tok/s | weight bandwidth: {:.2} GB/s | last_token={}",
             steps, ms_per_tok, tok_per_sec, gb_per_sec, cur_token
         );
+
+        let prompt_ids: Vec<usize> = (1..=16.min(cfg.max_seq_len / 2)).collect();
+        let decode_len = 8.min(cfg.max_seq_len - prompt_ids.len());
+        let gen_comp = run_generate_comparative_bench(
+            &engine,
+            &model,
+            &mut arena,
+            &model_weights,
+            &prompt_ids,
+            decode_len,
+            3,
+        );
+        print_generate_bench_table(&gen_comp);
+
+        let doc_seqs = vec![
+            vec![1usize, 2, 3, 4, 5, 6, 7, 8],
+            vec![9usize, 10, 11, 12, 13, 14, 15, 16],
+            vec![17usize, 18, 19, 20, 21, 22, 23, 24],
+            vec![1usize, 2, 3, 4, 5, 6, 7, 8],
+        ];
+        let query_seq = [1usize, 2, 3, 4, 5, 6, 7, 8];
+        let embed_comp = run_embed_comparative_bench(
+            &engine,
+            &model,
+            &mut arena,
+            &model_weights,
+            &doc_seqs,
+            &query_seq,
+            3,
+        );
+        print_embed_bench_table(&embed_comp);
     }
 
     if is_temp {
         let _ = std::fs::remove_file(&gguf_path);
     }
 }
+

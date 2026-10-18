@@ -299,52 +299,61 @@ impl Drop for AlignedArena {
     }
 }
 
+pub struct ThreadCountingAllocator;
+
+thread_local! {
+    static ALLOC_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static DEALLOC_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ALLOC_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+unsafe impl std::alloc::GlobalAlloc for ThreadCountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        ALLOC_COUNT.with(|c| c.set(c.get() + 1));
+        ALLOC_BYTES.with(|b| b.set(b.get().saturating_add(layout.size())));
+        unsafe { std::alloc::System.alloc(layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        ALLOC_COUNT.with(|c| c.set(c.get() + 1));
+        ALLOC_BYTES.with(|b| b.set(b.get().saturating_add(layout.size())));
+        unsafe { std::alloc::System.alloc_zeroed(layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        ALLOC_COUNT.with(|c| c.set(c.get() + 1));
+        ALLOC_BYTES.with(|b| b.set(b.get().saturating_add(new_size)));
+        unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        DEALLOC_COUNT.with(|c| c.set(c.get() + 1));
+        unsafe { std::alloc::System.dealloc(ptr, layout) }
+    }
+}
+
+#[global_allocator]
+static GLOBAL_ALLOC: ThreadCountingAllocator = ThreadCountingAllocator;
+
+/// Returns `(alloc_count, dealloc_count, allocated_bytes)` on the calling thread.
+pub fn current_thread_heap_stats() -> (usize, usize, usize) {
+    (
+        ALLOC_COUNT.with(|c| c.get()),
+        DEALLOC_COUNT.with(|c| c.get()),
+        ALLOC_BYTES.with(|b| b.get()),
+    )
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use crate::quant::blocks::{BlockQ4_0, QK4_0, quantize_row_q4_0, quantize_row_q8_0};
     use crate::quant::kernels::{gemv_q4_0, gemv_q4_0_arena};
     use bytemuck::Zeroable;
-    use std::alloc::{GlobalAlloc, System};
-    use std::cell::Cell;
-
-    struct ThreadCountingAllocator;
-
-    thread_local! {
-        static ALLOC_COUNT: Cell<usize> = const { Cell::new(0) };
-        static DEALLOC_COUNT: Cell<usize> = const { Cell::new(0) };
-    }
-
-    unsafe impl GlobalAlloc for ThreadCountingAllocator {
-        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            ALLOC_COUNT.with(|c| c.set(c.get() + 1));
-            unsafe { System.alloc(layout) }
-        }
-
-        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-            ALLOC_COUNT.with(|c| c.set(c.get() + 1));
-            unsafe { System.alloc_zeroed(layout) }
-        }
-
-        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-            ALLOC_COUNT.with(|c| c.set(c.get() + 1));
-            unsafe { System.realloc(ptr, layout, new_size) }
-        }
-
-        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-            DEALLOC_COUNT.with(|c| c.set(c.get() + 1));
-            unsafe { System.dealloc(ptr, layout) }
-        }
-    }
-
-    #[global_allocator]
-    static GLOBAL_ALLOC: ThreadCountingAllocator = ThreadCountingAllocator;
 
     pub(crate) fn current_thread_heap_ops() -> (usize, usize) {
-        (
-            ALLOC_COUNT.with(|c| c.get()),
-            DEALLOC_COUNT.with(|c| c.get()),
-        )
+        let (a, d, _) = current_thread_heap_stats();
+        (a, d)
     }
 
     #[test]

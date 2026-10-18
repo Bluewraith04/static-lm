@@ -2,7 +2,7 @@
 name = "static-lm"
 version = "0.1.0"
 edition = "2024"
-description = "Runs GGUF language models in a single pre-allocated memory buffer with Cranelift JIT-compiled operators and no heap allocations during execution"
+description = "CPU-only GGUF language model runtime that pre-allocates all working memory upfront, runs SIMD quantized matrix kernels, and JIT-compiles vector operators with Cranelift for zero heap allocations during execution"
 
 [dependencies]
 bytemuck = { version = "1.21", features = ["derive"] }
