@@ -41,8 +41,10 @@ fn build_synthetic_gguf(path: &std::path::Path, cfg: &TransformerConfig, num_lay
     writer.add_u32("llama.feed_forward_length", cfg.hidden_dim as u32);
     writer.add_u32("llama.attention.head_count", cfg.num_heads as u32);
     writer.add_u32("llama.attention.head_count_kv", cfg.num_kv_heads as u32);
+    writer.add_u32("llama.rope.dimension_count", cfg.head_dim() as u32);
     writer.add_u32("llama.context_length", cfg.max_seq_len as u32);
     writer.add_f32("llama.attention.layer_norm_rms_epsilon", cfg.rms_eps);
+    writer.add_str("tokenizer.ggml.model", "llama");
 
     // Build embedded GGUF vocabulary + BPE merge rules
     let base_tokens = [
@@ -51,7 +53,7 @@ fn build_synthetic_gguf(path: &std::path::Path, cfg: &TransformerConfig, num_lay
         "4", "5", "6", "7", "8", "9", "-", "_", ".", ",", ":", "/", "▁s", "▁st", "▁sta", "▁stat",
         "▁stati", "▁static", "▁l", "▁lm", "▁g", "▁gg", "▁ggu", "▁gguf", "▁j", "▁ji", "▁jit",
         "▁m", "▁mm", "▁mma", "▁mmap", "▁a", "▁ar", "▁are", "▁aren", "▁arena", "▁q", "▁q4",
-        "▁q8", "▁s", "▁si", "▁sim", "▁simd",
+        "▁q8", "▁q40", "▁si", "▁sim", "▁simd",
     ];
     let vocab_size = 512usize;
     let mut owned_vocab: Vec<String> = base_tokens.iter().map(|&s| s.to_owned()).collect();
@@ -178,7 +180,7 @@ fn build_synthetic_gguf(path: &std::path::Path, cfg: &TransformerConfig, num_lay
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(String::as_str).unwrap_or("all");
-    let cli_path = if matches!(mode, "bench" | "generate" | "embed" | "all") {
+    let cli_path = if matches!(mode, "bench" | "generate" | "embed" | "all" | "write-synthetic") {
         args.get(2).map(PathBuf::from)
     } else {
         args.get(1).map(PathBuf::from)
@@ -188,7 +190,7 @@ fn main() {
     let gguf_path =
         cli_path.unwrap_or_else(|| std::env::temp_dir().join("static_lm_bench.gguf"));
 
-    if is_temp {
+    if is_temp || mode == "write-synthetic" {
         let default_cfg = TransformerConfig {
             dim: 256,
             hidden_dim: 768,
@@ -198,6 +200,10 @@ fn main() {
             rms_eps: 1e-5,
         };
         build_synthetic_gguf(&gguf_path, &default_cfg, 2);
+        if mode == "write-synthetic" {
+            println!("wrote synthetic GGUF to {}", gguf_path.display());
+            return;
+        }
     }
 
     let gguf = GgufFile::open(&gguf_path).expect("failed to open GGUF file");
@@ -233,7 +239,11 @@ fn main() {
         .expect("failed to resolve GGUF model tensors");
 
     let mut engine = JitEngine::new();
-    let mut arena = AlignedArena::with_capacity(8 * 1024 * 1024);
+    let kv_floats = num_layers * 2 * cfg.max_seq_len * cfg.kv_dim();
+    let batch_floats = cfg.max_seq_len * (6 * cfg.dim + 4 * cfg.hidden_dim);
+    let arena_cap =
+        (kv_floats + batch_floats + model_weights.vocab_size * 2 + 1024 * 1024).max(8 * 1024 * 1024);
+    let mut arena = AlignedArena::with_capacity(arena_cap);
     let model = TransformerModel::new(
         &mut engine,
         &mut arena,
@@ -345,6 +355,11 @@ fn main() {
             steps, ms_per_tok, tok_per_sec, gb_per_sec, cur_token
         );
 
+        let bench_iters = args
+            .get(3)
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(if num_layers >= 6 { 1 } else { 3 });
+
         let prompt_ids: Vec<usize> = (1..=16.min(cfg.max_seq_len / 2)).collect();
         let decode_len = 8.min(cfg.max_seq_len - prompt_ids.len());
         let gen_comp = run_generate_comparative_bench(
@@ -354,7 +369,7 @@ fn main() {
             &model_weights,
             &prompt_ids,
             decode_len,
-            3,
+            bench_iters,
         );
         print_generate_bench_table(&gen_comp);
 
@@ -372,7 +387,7 @@ fn main() {
             &model_weights,
             &doc_seqs,
             &query_seq,
-            3,
+            bench_iters,
         );
         print_embed_bench_table(&embed_comp);
     }

@@ -4,12 +4,13 @@ use std::thread::{self, Thread};
 
 use crate::quant::blocks::{BlockQ4_0, BlockQ8_0, QK4_0};
 
-const PARALLEL_THRESHOLD_BLOCKS: usize = 65_536;
+const PARALLEL_THRESHOLD_BLOCKS: usize = 8_192;
 
 struct GemvJobState {
     weights_ptr: AtomicUsize,
     input_q8_ptr: AtomicUsize,
     output_ptr: AtomicUsize,
+    batch_size: AtomicUsize,
     rows: AtomicUsize,
     blocks_per_row: AtomicUsize,
     next_row: AtomicUsize,
@@ -31,12 +32,12 @@ unsafe fn execute_row_chunks(
     w_ptr: *const BlockQ4_0,
     in_ptr: *const BlockQ8_0,
     out_ptr: *mut f32,
+    batch_size: usize,
     rows: usize,
     blocks_per_row: usize,
     next_row: &AtomicUsize,
     chunk_size: usize,
 ) {
-    let in_q8 = unsafe { std::slice::from_raw_parts(in_ptr, blocks_per_row) };
     loop {
         let r_start = next_row.fetch_add(chunk_size, Ordering::Relaxed);
         if r_start >= rows {
@@ -46,9 +47,14 @@ unsafe fn execute_row_chunks(
         for r in r_start..r_end {
             let row_w =
                 unsafe { std::slice::from_raw_parts(w_ptr.add(r * blocks_per_row), blocks_per_row) };
-            let val = vec_dot_q4_0_q8_0(row_w, in_q8);
-            unsafe {
-                *out_ptr.add(r) = val;
+            for b in 0..batch_size {
+                let in_q8 = unsafe {
+                    std::slice::from_raw_parts(in_ptr.add(b * blocks_per_row), blocks_per_row)
+                };
+                let val = vec_dot_q4_0_q8_0(row_w, in_q8);
+                unsafe {
+                    *out_ptr.add(b * rows + r) = val;
+                }
             }
         }
     }
@@ -69,6 +75,7 @@ pub fn init_gemv_pool() {
             weights_ptr: AtomicUsize::new(0),
             input_q8_ptr: AtomicUsize::new(0),
             output_ptr: AtomicUsize::new(0),
+            batch_size: AtomicUsize::new(1),
             rows: AtomicUsize::new(0),
             blocks_per_row: AtomicUsize::new(0),
             next_row: AtomicUsize::new(0),
@@ -91,6 +98,7 @@ pub fn init_gemv_pool() {
                     let w_ptr = state.weights_ptr.load(Ordering::Acquire) as *const BlockQ4_0;
                     let in_ptr = state.input_q8_ptr.load(Ordering::Acquire) as *const BlockQ8_0;
                     let out_ptr = state.output_ptr.load(Ordering::Acquire) as *mut f32;
+                    let batch_size = state.batch_size.load(Ordering::Acquire);
                     let rows = state.rows.load(Ordering::Acquire);
                     let blocks_per_row = state.blocks_per_row.load(Ordering::Acquire);
                     let chunk_size = (rows / (num_workers + 1)).max(16);
@@ -100,6 +108,7 @@ pub fn init_gemv_pool() {
                             w_ptr,
                             in_ptr,
                             out_ptr,
+                            batch_size,
                             rows,
                             blocks_per_row,
                             &state.next_row,
@@ -262,64 +271,7 @@ pub fn gemv_q4_0(
     rows: usize,
     cols: usize,
 ) {
-    assert_eq!(cols % QK4_0, 0, "cols must be a multiple of 32");
-    let blocks_per_row = cols / QK4_0;
-    assert_eq!(input_q8.len(), blocks_per_row, "input_q8 length mismatch");
-    assert_eq!(output.len(), rows, "output length mismatch");
-    assert_eq!(
-        weights.len(),
-        rows * blocks_per_row,
-        "weights block count mismatch"
-    );
-
-    if weights.len() >= PARALLEL_THRESHOLD_BLOCKS && rows >= 64 {
-        if let Some(pool) = GEMV_POOL.get() {
-            if pool.num_workers > 0 {
-                if let Ok(_guard) = pool.dispatch_lock.try_lock() {
-                    let st = pool.state;
-                    st.weights_ptr.store(weights.as_ptr() as usize, Ordering::Release);
-                    st.input_q8_ptr
-                        .store(input_q8.as_ptr() as usize, Ordering::Release);
-                    st.output_ptr
-                        .store(output.as_mut_ptr() as usize, Ordering::Release);
-                    st.rows.store(rows, Ordering::Release);
-                    st.blocks_per_row.store(blocks_per_row, Ordering::Release);
-                    st.next_row.store(0, Ordering::Release);
-                    st.done_workers.store(0, Ordering::Release);
-
-                    st.generation.fetch_add(1, Ordering::AcqRel);
-                    for w in &pool.worker_threads {
-                        w.unpark();
-                    }
-
-                    let chunk_size = (rows / (pool.num_workers + 1)).max(16);
-                    unsafe {
-                        execute_row_chunks(
-                            weights.as_ptr(),
-                            input_q8.as_ptr(),
-                            output.as_mut_ptr(),
-                            rows,
-                            blocks_per_row,
-                            &st.next_row,
-                            chunk_size,
-                        );
-                    }
-
-                    while st.done_workers.load(Ordering::Acquire) < pool.num_workers {
-                        thread::yield_now();
-                    }
-                    return;
-                }
-            }
-        }
-    }
-
-    for (row_weights, out_val) in weights
-        .chunks_exact(blocks_per_row)
-        .zip(output.iter_mut())
-    {
-        *out_val = vec_dot_q4_0_q8_0(row_weights, input_q8);
-    }
+    gemm_q4_0(weights, input_q8, output, 1, rows, cols);
 }
 
 /// Zero-allocation arena-backed quantized Matrix-Vector multiplication (`output = weights * input`).
@@ -341,6 +293,8 @@ pub fn gemv_q4_0_arena(
 }
 
 /// Quantized Matrix-Matrix multiplication (`output[b, r] = weights[r, :] * inputs_q8[b, :]`).
+/// Loops over weight rows in the outer loop (`r in 0..rows`) and batch tokens in the inner loop (`b in 0..batch_size`)
+/// so each `Q4_0` weight row is loaded from DRAM once and reused across all batch tokens while hot in L1 cache.
 pub fn gemm_q4_0(
     weights: &[BlockQ4_0],
     inputs_q8: &[BlockQ8_0],
@@ -366,12 +320,68 @@ pub fn gemm_q4_0(
         rows * blocks_per_row,
         "weights block count mismatch"
     );
+    if batch_size == 0 || rows == 0 {
+        return;
+    }
 
-    for (in_row_q8, out_row) in inputs_q8
-        .chunks_exact(blocks_per_row)
-        .zip(output.chunks_exact_mut(rows))
-    {
-        gemv_q4_0(weights, in_row_q8, out_row, rows, cols);
+    if weights.len() * batch_size >= PARALLEL_THRESHOLD_BLOCKS && rows >= 64 {
+        if let Some(pool) = GEMV_POOL.get() {
+            if pool.num_workers > 0 {
+                if let Ok(_guard) = pool.dispatch_lock.try_lock() {
+                    let st = pool.state;
+                    st.weights_ptr.store(weights.as_ptr() as usize, Ordering::Release);
+                    st.input_q8_ptr
+                        .store(inputs_q8.as_ptr() as usize, Ordering::Release);
+                    st.output_ptr
+                        .store(output.as_mut_ptr() as usize, Ordering::Release);
+                    st.batch_size.store(batch_size, Ordering::Release);
+                    st.rows.store(rows, Ordering::Release);
+                    st.blocks_per_row.store(blocks_per_row, Ordering::Release);
+                    st.next_row.store(0, Ordering::Release);
+                    st.done_workers.store(0, Ordering::Release);
+
+                    st.generation.fetch_add(1, Ordering::AcqRel);
+                    for w in &pool.worker_threads {
+                        w.unpark();
+                    }
+
+                    let chunk_size = (rows / (pool.num_workers + 1)).max(16);
+                    unsafe {
+                        execute_row_chunks(
+                            weights.as_ptr(),
+                            inputs_q8.as_ptr(),
+                            output.as_mut_ptr(),
+                            batch_size,
+                            rows,
+                            blocks_per_row,
+                            &st.next_row,
+                            chunk_size,
+                        );
+                    }
+
+                    while st.done_workers.load(Ordering::Acquire) < pool.num_workers {
+                        thread::yield_now();
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
+    if batch_size == 1 {
+        for (row_weights, out_val) in weights
+            .chunks_exact(blocks_per_row)
+            .zip(output.iter_mut())
+        {
+            *out_val = vec_dot_q4_0_q8_0(row_weights, inputs_q8);
+        }
+    } else {
+        for (r, row_weights) in weights.chunks_exact(blocks_per_row).enumerate() {
+            for b in 0..batch_size {
+                let in_row_q8 = &inputs_q8[b * blocks_per_row..(b + 1) * blocks_per_row];
+                output[b * rows + r] = vec_dot_q4_0_q8_0(row_weights, in_row_q8);
+            }
+        }
     }
 }
 

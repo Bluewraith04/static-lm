@@ -342,11 +342,11 @@ fn f32_matmul_vec(weights: &[f32], x: &[f32], out: &mut [f32], rows: usize, cols
         let row = &weights[r * cols..(r + 1) * cols];
         let mut sum = 0.0f32;
         for c in 0..cols {
-            // Prevent compiler from collapsing synthetic benchmark loops into no-ops
-            sum += black_box(row[c]) * x[c];
+            sum += row[c] * x[c];
         }
         *out_val = sum;
     }
+    black_box(&mut *out);
 }
 
 fn f32_forward_hidden(

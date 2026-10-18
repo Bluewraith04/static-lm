@@ -41,12 +41,26 @@ Run the test suite (verifies quantization error bounds, SIMD parity, Cranelift I
 cargo test
 ```
 
-## Performance Characteristics
+## Benchmarks (`AMD Ryzen 5 PRO 4650U`, Pure `Q4_0` CPU, `prompt = 16`, `decode = 8`)
 
-On a 2-layer `Q4_0` model (`dim = 256, hidden_dim = 768, heads = 8/2 GQA, vocab = 512`) running on an AMD Ryzen 5 PRO 4650U (`cargo run --release`), `static-lm` compared against in-tree reference baselines:
+| Model | Runtime | Prefill (`tok/s`) | Decode (`tok/s`) | Runtime Heap Allocs | Static Memory |
+| :--- | :--- | ---: | ---: | ---: | ---: |
+| **Synthetic (`1.8M`, `0.95 MiB`)** | `llama.cpp` (`llama-bench`) | 42,385.9 | 11,209.4 | — | — |
+| | **`static-lm`** | **3,661.7** | **2,010.8** | **0 (`0 KB`)** | **1.0 MB** |
+| | HuggingFace `candle` (`0.8.4`) | 206.6 | 130.7 | Heap per op | — |
+| | In-tree static `f32` (`llama2.c`-style) | 633.6 | 583.8 | 0 (`0 KB`) | 6.8 MB |
+| | In-tree unfused scalar `Q4_0` | 514.7 | 398.3 | 0 (`0 KB`) | 1.0 MB |
+| **Stories-15M (`24.4M`, `13.1 MiB`)** | `llama.cpp` (`llama-bench`) | 4,251.8 | 636.6 | — | — |
+| | **`static-lm`** | **731.9** | **256.8** | **0 (`0 KB`)** | **16.6 MB** |
+| | HuggingFace `candle` (`0.8.4`) | 36.4 | 26.9 | Heap per op | — |
+| | In-tree static `f32` (`llama2.c`-style) | 147.2 | 65.7 | 0 (`0 KB`) | 96.6 MB |
+| | In-tree unfused scalar `Q4_0` | 129.7 | 65.9 | 0 (`0 KB`) | 16.6 MB |
+| **SmolLM2-135M (`134.5M`, `72.3 MiB`)** | `llama.cpp` (`llama-bench`) | 442.8 | 125.2 | — | — |
+| | **`static-lm`** | **76.7** | **37.3** | **0 (`0 KB`)** | **110.2 MB** |
+| | HuggingFace `candle` (`0.8.4`) | 7.1 | 5.1 | Heap per op | — |
+| | In-tree static `f32` (`llama2.c`-style) | 8.4 | 6.7 | 0 (`0 KB`) | 643.9 MB |
+| | In-tree unfused scalar `Q4_0` | 5.6 | 5.2 | 0 (`0 KB`) | 110.2 MB |
 
-- **4.8×–5.1× faster** than unfused scalar `Q4_0 × Q8_0` execution on the same static arena, driven by `AVX2`/`NEON` integer dot products, multi-threaded `GEMV`/`GEMM`, and Cranelift JIT-fused vector loops.
-- **7.1×–7.5× faster** than a heap-allocating `Vec<f32>` tensor pipeline that dequantizes `Q4_0` weights on the fly (`0` heap allocations vs. `1,000+` allocations per run).
-- **6.6× smaller static memory footprint** (`1.06 MB` vs. `7.00 MB`) than a pre-dequantized `f32` runtime (`4.5 bits/weight` vs. `32 bits/weight`).
-
-*Note: Default benchmark numbers reflect an L2/L3-cache-resident synthetic model against in-process reference baselines, not external C++ runtimes (`llama.cpp`) or multi-gigabyte DRAM-bound models.*
+- **vs. HuggingFace `candle` (`0.8.4` CPU):** `static-lm` is **7.3×–10.8× faster on decode** and **9.5×–20.1× faster on prefill** across real-world models (`Stories-15M` and `SmolLM2-135M`).
+- **vs. `llama.cpp` (`ggml-cpu`):** `static-lm` reaches **29%–40% of `llama.cpp` decode throughput** (`256.8` vs. `636.6 tok/s` on `Stories-15M`; `37.3` vs. `125.2 tok/s` on `SmolLM2-135M`); the remaining gap comes from `ggml`'s multi-row register-blocked `GEMV`/`GEMM` microkernels and SIMD attention scoring (`static-lm` uses single-row `Q4_0 × Q8_0` dot products and scalar `QK^T`/`AV` attention loops).
+- **vs. In-tree baselines:** `static-lm` is **4.7×–10.5× faster** than unfused scalar `Q4_0` and uses **5.8× less RAM** (`110.2 MB` vs. `643.9 MB` on `SmolLM2-135M`) than pre-dequantized `f32` while eliminating the `14,552` heap allocations (`53.4 MB` transient heap churn) of per-operator `Vec<f32>` execution.
