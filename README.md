@@ -2,14 +2,35 @@
 
 CPU-only GGUF language and embedding model runtime in Rust. It maps quantized weights directly from disk via `mmap`, pre-allocates all working memory upfront in a single 64-byte-aligned arena, executes `AVX2`/`NEON` `Q4_0 × Q8_0` matrix kernels, and JIT-compiles vector operators (`RMSNorm`, `SwiGLU`, `Softmax`, `L2Norm`, `ResidualAdd`) to native machine code using Cranelift.
 
-## Guarantees & Scope
+## Features & Scope
 
 - **Zero runtime heap allocations:** Once initialized, token generation, prompt prefill, and embedding extraction perform `0` heap allocations (`malloc` and `free` are never called in the hot loop).
 - **Fixed memory footprint:** All activation buffers, `Q8_0` quantization scratch space, and KV-caches live in a single pre-allocated buffer (`AlignedArena`). Memory usage never grows during execution.
 - **Zero-copy weights:** `.gguf` (v2/v3) weight tensors are referenced directly from the OS page cache as `&[BlockQ4_0]` and `&[f32]` slices.
 - **Supported models:** Llama-family architectures (`RMSNorm`, `RoPE`, Multi-Head / Grouped-Query Attention, `SwiGLU`) quantized with `Q4_0` weights and `F32` normalization scales.
 
-## Usage
+## Installation
+
+Clone the repository:
+
+```bash
+git clone https://github.com/Bluewraith04/static-lm.git
+```
+
+Clone with GitHub CLI:
+
+```bash
+gh repo clone Bluewraith04/static-lm
+```
+
+Add as a dependency in `Cargo.toml`:
+
+```toml
+[dependencies]
+static-lm = { git = "https://github.com/Bluewraith04/static-lm.git" }
+```
+
+## CLI Usage
 
 Run the full suite (text generation, embedding search, and comparative benchmarks) using a self-generated synthetic GGUF model:
 
@@ -45,6 +66,65 @@ Run the test suite (verifies quantization error bounds, SIMD parity, Cranelift I
 
 ```bash
 cargo test
+```
+
+## Rust Library Usage
+
+```rust
+use std::path::Path;
+use static_lm::jit::engine::JitEngine;
+use static_lm::memory::arena::AlignedArena;
+use static_lm::memory::loader::GgufFile;
+use static_lm::model::tokenizer::GgufTokenizer;
+use static_lm::model::transformer::{TransformerConfig, TransformerModel};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let gguf = GgufFile::open(Path::new("model.gguf"))?;
+    let arch = gguf.get_str("general.architecture").unwrap_or("llama");
+    let num_layers = gguf
+        .get_u32(&format!("{arch}.block_count"))
+        .unwrap_or(1) as usize;
+    let model_weights = gguf.model_weights(num_layers)?;
+    let tokenizer = GgufTokenizer::from_gguf(&gguf)?;
+
+    let cfg = TransformerConfig {
+        dim: gguf.get_u32(&format!("{arch}.embedding_length")).unwrap_or(256) as usize,
+        hidden_dim: gguf.get_u32(&format!("{arch}.feed_forward_length")).unwrap_or(512) as usize,
+        num_heads: gguf.get_u32(&format!("{arch}.attention.head_count")).unwrap_or(4) as usize,
+        num_kv_heads: gguf.get_u32(&format!("{arch}.attention.head_count_kv")).unwrap_or(4) as usize,
+        max_seq_len: 512,
+        rms_eps: gguf.get_f32(&format!("{arch}.attention.layer_norm_rms_epsilon")).unwrap_or(1e-5),
+    };
+
+    let kv_floats = num_layers * 2 * cfg.max_seq_len * cfg.kv_dim();
+    let batch_floats = cfg.max_seq_len * (6 * cfg.dim + 4 * cfg.hidden_dim);
+    let arena_cap = (kv_floats + batch_floats + model_weights.vocab_size * 2 + 1024 * 1024)
+        .max(8 * 1024 * 1024);
+    let mut arena = AlignedArena::with_capacity(arena_cap);
+
+    let mut engine = JitEngine::new();
+    let model = TransformerModel::new(
+        &mut engine,
+        &mut arena,
+        cfg,
+        num_layers,
+        model_weights.vocab_size,
+    );
+
+    let prompt = tokenizer.encode("Hello world", true);
+    let mut output = [0usize; 32];
+    let generated = model.generate(
+        &engine,
+        &mut arena,
+        &model_weights,
+        &prompt,
+        &mut output,
+        Some(tokenizer.eos_token_id),
+    );
+
+    println!("Decoded: {}", tokenizer.decode(&output[..generated]));
+    Ok(())
+}
 ```
 
 ## Benchmarks
