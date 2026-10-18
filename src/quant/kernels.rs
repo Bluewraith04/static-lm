@@ -1,4 +1,126 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::thread::{self, Thread};
+
 use crate::quant::blocks::{BlockQ4_0, BlockQ8_0, QK4_0};
+
+const PARALLEL_THRESHOLD_BLOCKS: usize = 65_536;
+
+struct GemvJobState {
+    weights_ptr: AtomicUsize,
+    input_q8_ptr: AtomicUsize,
+    output_ptr: AtomicUsize,
+    rows: AtomicUsize,
+    blocks_per_row: AtomicUsize,
+    next_row: AtomicUsize,
+    done_workers: AtomicUsize,
+    generation: AtomicUsize,
+}
+
+struct GemvPool {
+    num_workers: usize,
+    worker_threads: Vec<Thread>,
+    dispatch_lock: Mutex<()>,
+    state: &'static GemvJobState,
+}
+
+static GEMV_POOL: OnceLock<GemvPool> = OnceLock::new();
+
+#[inline]
+unsafe fn execute_row_chunks(
+    w_ptr: *const BlockQ4_0,
+    in_ptr: *const BlockQ8_0,
+    out_ptr: *mut f32,
+    rows: usize,
+    blocks_per_row: usize,
+    next_row: &AtomicUsize,
+    chunk_size: usize,
+) {
+    let in_q8 = unsafe { std::slice::from_raw_parts(in_ptr, blocks_per_row) };
+    loop {
+        let r_start = next_row.fetch_add(chunk_size, Ordering::Relaxed);
+        if r_start >= rows {
+            break;
+        }
+        let r_end = (r_start + chunk_size).min(rows);
+        for r in r_start..r_end {
+            let row_w =
+                unsafe { std::slice::from_raw_parts(w_ptr.add(r * blocks_per_row), blocks_per_row) };
+            let val = vec_dot_q4_0_q8_0(row_w, in_q8);
+            unsafe {
+                *out_ptr.add(r) = val;
+            }
+        }
+    }
+}
+
+/// Initializes the persistent background worker threads for parallel `GEMV`/`GEMM`.
+/// Safe to call multiple times; performs allocation only on the first call.
+pub fn init_gemv_pool() {
+    let _ = GEMV_POOL.get_or_init(|| {
+        let logical_cpus = thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        // Target physical cores (logical_cpus / 2) to avoid SMT FMA contention and VM preemptions
+        let total_threads = (logical_cpus / 2).max(1);
+        let num_workers = total_threads.saturating_sub(1);
+
+        let state: &'static GemvJobState = Box::leak(Box::new(GemvJobState {
+            weights_ptr: AtomicUsize::new(0),
+            input_q8_ptr: AtomicUsize::new(0),
+            output_ptr: AtomicUsize::new(0),
+            rows: AtomicUsize::new(0),
+            blocks_per_row: AtomicUsize::new(0),
+            next_row: AtomicUsize::new(0),
+            done_workers: AtomicUsize::new(0),
+            generation: AtomicUsize::new(0),
+        }));
+
+        let mut worker_threads = Vec::with_capacity(num_workers);
+        for _ in 0..num_workers {
+            let handle = thread::spawn(move || {
+                let mut seen_gen = 0usize;
+                loop {
+                    let mut cur_gen = state.generation.load(Ordering::Acquire);
+                    while cur_gen == seen_gen {
+                        thread::park();
+                        cur_gen = state.generation.load(Ordering::Acquire);
+                    }
+                    seen_gen = cur_gen;
+
+                    let w_ptr = state.weights_ptr.load(Ordering::Acquire) as *const BlockQ4_0;
+                    let in_ptr = state.input_q8_ptr.load(Ordering::Acquire) as *const BlockQ8_0;
+                    let out_ptr = state.output_ptr.load(Ordering::Acquire) as *mut f32;
+                    let rows = state.rows.load(Ordering::Acquire);
+                    let blocks_per_row = state.blocks_per_row.load(Ordering::Acquire);
+                    let chunk_size = (rows / (num_workers + 1)).max(16);
+
+                    unsafe {
+                        execute_row_chunks(
+                            w_ptr,
+                            in_ptr,
+                            out_ptr,
+                            rows,
+                            blocks_per_row,
+                            &state.next_row,
+                            chunk_size,
+                        );
+                    }
+
+                    state.done_workers.fetch_add(1, Ordering::Release);
+                }
+            });
+            worker_threads.push(handle.thread().clone());
+        }
+
+        GemvPool {
+            num_workers,
+            worker_threads,
+            dispatch_lock: Mutex::new(()),
+            state,
+        }
+    });
+}
 
 /// Reference scalar dot product between `Q4_0` weights and `Q8_0` activations.
 pub fn vec_dot_q4_0_q8_0_scalar(weights: &[BlockQ4_0], activations: &[BlockQ8_0]) -> f32 {
@@ -28,6 +150,7 @@ unsafe fn vec_dot_q4_0_q8_0_avx2(weights: &[BlockQ4_0], activations: &[BlockQ8_0
 
     let mask_low = _mm_set1_epi8(0x0F);
     let offset_8 = _mm256_set1_epi8(8);
+    let clamp_min_i8 = _mm256_set1_epi8(-127);
     let ones_16 = _mm256_set1_epi16(1);
     let mut acc = _mm256_setzero_ps();
 
@@ -44,8 +167,9 @@ unsafe fn vec_dot_q4_0_q8_0_avx2(weights: &[BlockQ4_0], activations: &[BlockQ8_0
         let q4_u8 = _mm256_set_m128i(q4_hi, q4_lo);
         let w_i8 = _mm256_sub_epi8(q4_u8, offset_8);
 
-        // Load 32 signed i8 activations
-        let a_i8 = unsafe { _mm256_loadu_si256(a_block.qs.as_ptr() as *const __m256i) };
+        // Load 32 signed i8 activations and clamp -128 to -127 so _mm256_sign_epi8 never wraps
+        let raw_a_i8 = unsafe { _mm256_loadu_si256(a_block.qs.as_ptr() as *const __m256i) };
+        let a_i8 = _mm256_max_epi8(raw_a_i8, clamp_min_i8);
 
         // Unsigned * signed multiply-add via sign-transfer trick
         let ax = _mm256_sign_epi8(w_i8, w_i8);
@@ -68,6 +192,43 @@ unsafe fn vec_dot_q4_0_q8_0_avx2(weights: &[BlockQ4_0], activations: &[BlockQ8_0
     _mm_cvtss_f32(total)
 }
 
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn vec_dot_q4_0_q8_0_neon(weights: &[BlockQ4_0], activations: &[BlockQ8_0]) -> f32 {
+    use std::arch::aarch64::*;
+
+    debug_assert_eq!(weights.len(), activations.len());
+
+    let mask_low = vdupq_n_u8(0x0F);
+    let offset_8 = vdupq_n_s8(8);
+    let mut sumf = 0.0f32;
+
+    for (w_block, a_block) in weights.iter().zip(activations.iter()) {
+        let d = w_block.scale() * a_block.scale();
+
+        let raw_q4 = unsafe { vld1q_u8(w_block.qs.as_ptr()) };
+        let q4_lo = vreinterpretq_s8_u8(vandq_u8(raw_q4, mask_low));
+        let q4_hi = vreinterpretq_s8_u8(vshrq_n_u8(raw_q4, 4));
+        let w_lo = vsubq_s8(q4_lo, offset_8);
+        let w_hi = vsubq_s8(q4_hi, offset_8);
+
+        let a_lo = unsafe { vld1q_s8(a_block.qs.as_ptr()) };
+        let a_hi = unsafe { vld1q_s8(a_block.qs.as_ptr().add(16)) };
+
+        let p0 = vmull_s8(vget_low_s8(w_lo), vget_low_s8(a_lo));
+        let p0 = vmlal_s8(p0, vget_high_s8(w_lo), vget_high_s8(a_lo));
+        let p1 = vmull_s8(vget_low_s8(w_hi), vget_low_s8(a_hi));
+        let p1 = vmlal_s8(p1, vget_high_s8(w_hi), vget_high_s8(a_hi));
+
+        let sum_i16 = vaddq_s16(p0, p1);
+        let sum_i32 = vpaddlq_s16(sum_i16);
+        let block_sum = vaddvq_s32(sum_i32);
+        sumf += (block_sum as f32) * d;
+    }
+
+    sumf
+}
+
 /// Hardware-accelerated dot product between `Q4_0` weights and `Q8_0` activations.
 #[inline]
 pub fn vec_dot_q4_0_q8_0(weights: &[BlockQ4_0], activations: &[BlockQ8_0]) -> f32 {
@@ -82,10 +243,18 @@ pub fn vec_dot_q4_0_q8_0(weights: &[BlockQ4_0], activations: &[BlockQ8_0]) -> f3
         }
     }
 
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            // SAFETY: NEON support verified via runtime feature detection.
+            return unsafe { vec_dot_q4_0_q8_0_neon(weights, activations) };
+        }
+    }
+
     vec_dot_q4_0_q8_0_scalar(weights, activations)
 }
 
-/// Quantized Matrix-Vector multiplication (`output = weights * input_q8`).
+/// Parallel row-wise Quantized Matrix-Vector multiplication (`output = weights * input_q8`).
 pub fn gemv_q4_0(
     weights: &[BlockQ4_0],
     input_q8: &[BlockQ8_0],
@@ -102,6 +271,48 @@ pub fn gemv_q4_0(
         rows * blocks_per_row,
         "weights block count mismatch"
     );
+
+    if weights.len() >= PARALLEL_THRESHOLD_BLOCKS && rows >= 64 {
+        if let Some(pool) = GEMV_POOL.get() {
+            if pool.num_workers > 0 {
+                if let Ok(_guard) = pool.dispatch_lock.try_lock() {
+                    let st = pool.state;
+                    st.weights_ptr.store(weights.as_ptr() as usize, Ordering::Release);
+                    st.input_q8_ptr
+                        .store(input_q8.as_ptr() as usize, Ordering::Release);
+                    st.output_ptr
+                        .store(output.as_mut_ptr() as usize, Ordering::Release);
+                    st.rows.store(rows, Ordering::Release);
+                    st.blocks_per_row.store(blocks_per_row, Ordering::Release);
+                    st.next_row.store(0, Ordering::Release);
+                    st.done_workers.store(0, Ordering::Release);
+
+                    st.generation.fetch_add(1, Ordering::AcqRel);
+                    for w in &pool.worker_threads {
+                        w.unpark();
+                    }
+
+                    let chunk_size = (rows / (pool.num_workers + 1)).max(16);
+                    unsafe {
+                        execute_row_chunks(
+                            weights.as_ptr(),
+                            input_q8.as_ptr(),
+                            output.as_mut_ptr(),
+                            rows,
+                            blocks_per_row,
+                            &st.next_row,
+                            chunk_size,
+                        );
+                    }
+
+                    while st.done_workers.load(Ordering::Acquire) < pool.num_workers {
+                        thread::yield_now();
+                    }
+                    return;
+                }
+            }
+        }
+    }
 
     for (row_weights, out_val) in weights
         .chunks_exact(blocks_per_row)
@@ -129,10 +340,68 @@ pub fn gemv_q4_0_arena(
     gemv_q4_0(weights, x_q8, y_f32, rows, cols);
 }
 
+/// Quantized Matrix-Matrix multiplication (`output[b, r] = weights[r, :] * inputs_q8[b, :]`).
+pub fn gemm_q4_0(
+    weights: &[BlockQ4_0],
+    inputs_q8: &[BlockQ8_0],
+    output: &mut [f32],
+    batch_size: usize,
+    rows: usize,
+    cols: usize,
+) {
+    assert_eq!(cols % QK4_0, 0, "cols must be a multiple of 32");
+    let blocks_per_row = cols / QK4_0;
+    assert_eq!(
+        inputs_q8.len(),
+        batch_size * blocks_per_row,
+        "inputs_q8 batch block count mismatch"
+    );
+    assert_eq!(
+        output.len(),
+        batch_size * rows,
+        "output batch length mismatch"
+    );
+    assert_eq!(
+        weights.len(),
+        rows * blocks_per_row,
+        "weights block count mismatch"
+    );
+
+    for (in_row_q8, out_row) in inputs_q8
+        .chunks_exact(blocks_per_row)
+        .zip(output.chunks_exact_mut(rows))
+    {
+        gemv_q4_0(weights, in_row_q8, out_row, rows, cols);
+    }
+}
+
+/// Zero-allocation arena-backed quantized Matrix-Matrix multiplication (`output = inputs * weights^T`).
+/// Dynamically quantizes `batch_size * cols` floats from `inputs` into `q8_scratch` before executing `gemm_q4_0`.
+pub fn gemm_q4_0_arena(
+    arena: &mut crate::memory::arena::AlignedArena,
+    weights: &[BlockQ4_0],
+    inputs: crate::memory::arena::ArenaSlice,
+    q8_scratch: crate::memory::arena::ArenaSlice,
+    output: crate::memory::arena::ArenaSlice,
+    batch_size: usize,
+    rows: usize,
+    cols: usize,
+) {
+    assert_eq!(cols % QK4_0, 0, "cols must be a multiple of 32");
+    assert_eq!(inputs.len, batch_size * cols, "inputs batch size mismatch");
+    assert_eq!(output.len, batch_size * rows, "output batch size mismatch");
+    let total_q8_blocks = batch_size * (cols / QK4_0);
+    let (x_f32, x_q8, y_f32) = arena.gemv_slices(inputs, q8_scratch, output, total_q8_blocks);
+    crate::quant::blocks::quantize_row_q8_0(x_f32, x_q8);
+    gemm_q4_0(weights, x_q8, y_f32, batch_size, rows, cols);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::quant::blocks::{quantize_row_q4_0, quantize_row_q8_0, QK8_0};
+    use crate::memory::arena::AlignedArena;
+    use crate::memory::arena::tests::current_thread_heap_ops;
+    use crate::quant::blocks::{QK8_0, quantize_row_q4_0, quantize_row_q8_0};
     use bytemuck::Zeroable;
 
     fn pseudo_random_f32(len: usize, mut seed: u32) -> Vec<f32> {
@@ -158,7 +427,6 @@ mod tests {
     #[test]
     fn test_vec_dot_scalar_vs_f32_reference() {
         let n = 4096;
-        // Offset positive distribution so expected dot product has strong magnitude
         let w_f32: Vec<f32> = pseudo_random_f32(n, 0xCAFE_BABE)
             .into_iter()
             .map(|x| x + 0.5)
@@ -205,9 +473,9 @@ mod tests {
     }
 
     #[test]
-    fn test_gemv_q4_0_against_naive_f32() {
-        let rows = 32;
-        let cols = 1024;
+    fn test_gemv_q4_0_against_naive_f32_and_parallel_zero_alloc() {
+        let rows = 512;
+        let cols = 4096;
         let blocks_per_row = cols / QK4_0;
         let w_f32: Vec<f32> = pseudo_random_f32(rows * cols, 0x99AA_BBCC)
             .into_iter()
@@ -223,15 +491,20 @@ mod tests {
         quantize_row_q4_0(&w_f32, &mut w_q4);
         quantize_row_q8_0(&x_f32, &mut x_q8);
 
+        init_gemv_pool();
         let mut out_quant = vec![0.0f32; rows];
+        let ops_before = current_thread_heap_ops();
         gemv_q4_0(&w_q4, &x_q8, &mut out_quant, rows, cols);
+        let ops_after = current_thread_heap_ops();
+        assert_eq!(ops_after, ops_before, "parallel gemv_q4_0 must not allocate");
 
         let mut total_rel_err = 0.0f32;
         for r in 0..rows {
             let row_q4 = &w_q4[r * blocks_per_row..(r + 1) * blocks_per_row];
             let scalar_val = vec_dot_q4_0_q8_0_scalar(row_q4, &x_q8);
+            let simd_rel_diff = (scalar_val - out_quant[r]).abs() / scalar_val.abs().max(1.0);
             assert!(
-                (scalar_val - out_quant[r]).abs() < 1e-4,
+                simd_rel_diff < 1e-5,
                 "row {r} SIMD GEMV diverged from scalar: {scalar_val} vs {}",
                 out_quant[r]
             );
@@ -251,5 +524,89 @@ mod tests {
             mean_rel_err < 1e-2,
             "mean GEMV rel_err {mean_rel_err} exceeded 1e-2"
         );
+    }
+
+    #[test]
+    fn test_gemm_q4_0_against_naive_f32_and_zero_alloc() {
+        let batch_size = 4;
+        let rows = 32;
+        let cols = 256;
+        let blocks_per_row = cols / QK4_0;
+
+        let w_f32: Vec<f32> = pseudo_random_f32(rows * cols, 0xABCD_1234)
+            .into_iter()
+            .map(|x| x + 0.5)
+            .collect();
+        let x_f32: Vec<f32> = pseudo_random_f32(batch_size * cols, 0x5678_EF90)
+            .into_iter()
+            .map(|x| x + 0.5)
+            .collect();
+
+        let mut w_q4 = vec![BlockQ4_0::zeroed(); rows * blocks_per_row];
+        quantize_row_q4_0(&w_f32, &mut w_q4);
+
+        let mut arena = AlignedArena::with_capacity(8192);
+        let s_in = arena.alloc_slice(batch_size * cols);
+        let s_q8 = arena.alloc_q8_scratch(batch_size * blocks_per_row);
+        let s_out = arena.alloc_slice(batch_size * rows);
+        arena.get_mut(s_in).copy_from_slice(&x_f32);
+
+        let ops_before = current_thread_heap_ops();
+        gemm_q4_0_arena(&mut arena, &w_q4, s_in, s_q8, s_out, batch_size, rows, cols);
+        let ops_after = current_thread_heap_ops();
+        assert_eq!(ops_after, ops_before, "gemm_q4_0_arena must perform 0 heap ops");
+
+        let out = arena.get(s_out);
+        let mut x_q8_ref = vec![BlockQ8_0::zeroed(); batch_size * blocks_per_row];
+        quantize_row_q8_0(&x_f32, &mut x_q8_ref);
+
+        for b in 0..batch_size {
+            let b_q8 = &x_q8_ref[b * blocks_per_row..(b + 1) * blocks_per_row];
+            for r in 0..rows {
+                let row_w = &w_q4[r * blocks_per_row..(r + 1) * blocks_per_row];
+                let expected = vec_dot_q4_0_q8_0_scalar(row_w, b_q8);
+                let actual = out[b * rows + r];
+                assert!(
+                    (expected - actual).abs() < 1e-4,
+                    "GEMM batch {b} row {r} mismatch: expected={expected}, actual={actual}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_vec_dot_odd_block_counts_and_saturation() {
+        use half::f16;
+
+        for num_blocks in [1usize, 3, 7, 17] {
+            let n = num_blocks * QK4_0;
+            let w_f32 = pseudo_random_f32(n, 0x1000 + num_blocks as u32);
+            let a_f32 = pseudo_random_f32(n, 0x2000 + num_blocks as u32);
+            let mut w_q4 = vec![BlockQ4_0::zeroed(); num_blocks];
+            let mut a_q8 = vec![BlockQ8_0::zeroed(); num_blocks];
+            quantize_row_q4_0(&w_f32, &mut w_q4);
+            quantize_row_q8_0(&a_f32, &mut a_q8);
+
+            let s = vec_dot_q4_0_q8_0_scalar(&w_q4, &a_q8);
+            let v = vec_dot_q4_0_q8_0(&w_q4, &a_q8);
+            assert!(
+                (s - v).abs() < 1e-5,
+                "num_blocks={num_blocks} mismatch: scalar={s}, simd={v}"
+            );
+        }
+
+        let d_one = f16::from_f32(1.0).to_bits();
+        let w_min = [BlockQ4_0 { d: d_one, qs: [0x00; 16] }];
+        let w_max = [BlockQ4_0 { d: d_one, qs: [0xFF; 16] }];
+        let a_min = [BlockQ8_0 { d: d_one, qs: [-127; 32] }];
+        let a_max = [BlockQ8_0 { d: d_one, qs: [127; 32] }];
+
+        assert_eq!(vec_dot_q4_0_q8_0(&w_min, &a_min), 32_512.0);
+        assert_eq!(vec_dot_q4_0_q8_0_scalar(&w_min, &a_min), 32_512.0);
+        assert_eq!(vec_dot_q4_0_q8_0(&w_max, &a_max), 28_448.0);
+        assert_eq!(vec_dot_q4_0_q8_0_scalar(&w_max, &a_max), 28_448.0);
+
+        let a_i8_min = [BlockQ8_0 { d: d_one, qs: [-128; 32] }];
+        assert_eq!(vec_dot_q4_0_q8_0(&w_min, &a_i8_min), 32_512.0);
     }
 }

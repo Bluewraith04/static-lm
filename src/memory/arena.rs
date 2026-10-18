@@ -49,6 +49,7 @@ unsafe impl Sync for AlignedArena {}
 impl AlignedArena {
     /// Allocates a zeroed, 64-byte aligned `f32` arena with at least `capacity` elements.
     pub fn with_capacity(capacity: usize) -> Self {
+        crate::quant::kernels::init_gemv_pool();
         let aligned_cap = capacity
             .max(ELEMENTS_PER_CACHE_LINE)
             .next_multiple_of(ELEMENTS_PER_CACHE_LINE);
@@ -311,6 +312,7 @@ pub(crate) mod tests {
 
     thread_local! {
         static ALLOC_COUNT: Cell<usize> = const { Cell::new(0) };
+        static DEALLOC_COUNT: Cell<usize> = const { Cell::new(0) };
     }
 
     unsafe impl GlobalAlloc for ThreadCountingAllocator {
@@ -330,6 +332,7 @@ pub(crate) mod tests {
         }
 
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            DEALLOC_COUNT.with(|c| c.set(c.get() + 1));
             unsafe { System.dealloc(ptr, layout) }
         }
     }
@@ -337,8 +340,11 @@ pub(crate) mod tests {
     #[global_allocator]
     static GLOBAL_ALLOC: ThreadCountingAllocator = ThreadCountingAllocator;
 
-    pub(crate) fn current_thread_allocs() -> usize {
-        ALLOC_COUNT.with(|c| c.get())
+    pub(crate) fn current_thread_heap_ops() -> (usize, usize) {
+        (
+            ALLOC_COUNT.with(|c| c.get()),
+            DEALLOC_COUNT.with(|c| c.get()),
+        )
     }
 
     #[test]
@@ -403,8 +409,8 @@ pub(crate) mod tests {
 
         arena.get_mut(ping).copy_from_slice(&init_input);
 
-        // Warm up TLS counter and snapshot allocation count before the hot loop
-        let allocs_before = current_thread_allocs();
+        // Warm up TLS counter and snapshot heap operation counts before the hot loop
+        let ops_before = current_thread_heap_ops();
 
         // Execute 10 tokens x 4-layer GEMV forward pass strictly inside the arena
         for _step in 0..10 {
@@ -414,11 +420,11 @@ pub(crate) mod tests {
             gemv_q4_0_arena(&mut arena, &layers[3], pong, q8_scratch, ping, dim, dim);
         }
 
-        let allocs_after = current_thread_allocs();
+        let ops_after = current_thread_heap_ops();
         assert_eq!(
-            allocs_after, allocs_before,
-            "Expected 0 heap allocations during hot GEMV loop, found {}",
-            allocs_after - allocs_before
+            ops_after, ops_before,
+            "Expected 0 heap allocs/deallocs during hot GEMV loop, found {:?}",
+            (ops_after.0 - ops_before.0, ops_after.1 - ops_before.1)
         );
 
         // Verify numerical equivalence against a standalone reference pass for 1 full 4-layer step

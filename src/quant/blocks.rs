@@ -183,4 +183,38 @@ mod tests {
             assert!(diff <= 0.005, "Q8_0 roundtrip diff too high: {diff} ({orig} vs {rec})");
         }
     }
+
+    #[test]
+    fn test_quantize_edge_cases_zero_and_extremes() {
+        // 1. All-zero input must produce 0 scale and reconstruct to exact 0.0
+        let zeros = [0.0f32; 64];
+        let mut q4 = [BlockQ4_0::zeroed(); 2];
+        let mut q8 = [BlockQ8_0::zeroed(); 2];
+        let mut rec4 = [1.0f32; 64];
+        let mut rec8 = [1.0f32; 64];
+
+        quantize_row_q4_0(&zeros, &mut q4);
+        quantize_row_q8_0(&zeros, &mut q8);
+        dequantize_row_q4_0(&q4, &mut rec4);
+        dequantize_row_q8_0(&q8, &mut rec8);
+
+        assert_eq!(q4[0].scale(), 0.0);
+        assert_eq!(q8[0].scale(), 0.0);
+        assert!(rec4.iter().all(|&v| v == 0.0));
+        assert!(rec8.iter().all(|&v| v == 0.0));
+
+        // 2. Strictly negative and large-magnitude blocks
+        let mut neg_block = [0.0f32; 32];
+        for (i, v) in neg_block.iter_mut().enumerate() {
+            *v = -((i as f32) + 1.0) * 10.0; // [-320.0 .. -10.0]
+        }
+        let mut q4_neg = [BlockQ4_0::zeroed(); 1];
+        let mut rec4_neg = [0.0f32; 32];
+        quantize_row_q4_0(&neg_block, &mut q4_neg);
+        dequantize_row_q4_0(&q4_neg, &mut rec4_neg);
+        // Max step is 320 / 8 = 40, half-step = 20
+        for (&o, &r) in neg_block.iter().zip(rec4_neg.iter()) {
+            assert!((o - r).abs() <= 20.5, "neg block mismatch: {o} vs {r}");
+        }
+    }
 }

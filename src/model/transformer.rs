@@ -1,7 +1,7 @@
 use crate::jit::engine::{JitEngine, JitKernelFn};
 use crate::jit::graph::FuseGraph;
 use crate::memory::arena::{AlignedArena, ArenaSlice};
-use crate::quant::blocks::{BlockQ4_0, QK4_0};
+use crate::quant::blocks::{BlockQ4_0, QK4_0, dequantize_row_q4_0};
 use crate::quant::kernels::gemv_q4_0_arena;
 
 /// Flat concrete hyperparameters for a single Transformer block.
@@ -35,6 +35,16 @@ pub struct TransformerWeights<'a> {
     pub w_down: &'a [BlockQ4_0],
 }
 
+/// Zero-copy views of a complete Transformer model (`token_embd`, layers, `output_norm`, `output`).
+#[derive(Clone, Debug)]
+pub struct ModelWeights<'a> {
+    pub token_embd: &'a [BlockQ4_0],
+    pub layers: Vec<TransformerWeights<'a>>,
+    pub output_norm: &'a [f32],
+    pub lm_head: &'a [BlockQ4_0],
+    pub vocab_size: usize,
+}
+
 /// Pre-allocated [`ArenaSlice`] handles for zero-allocation execution of a Transformer layer.
 #[derive(Copy, Clone, Debug)]
 pub struct LayerWorkspace {
@@ -50,10 +60,12 @@ pub struct LayerWorkspace {
     pub hb2: ArenaSlice,
     pub hb_act: ArenaSlice,
     pub q8_scratch: ArenaSlice,
+    pub rope_cos: ArenaSlice,
+    pub rope_sin: ArenaSlice,
 }
 
 impl LayerWorkspace {
-    /// Bump-allocates all intermediate activation, scratch, and KV-cache slices from `arena`.
+    /// Bump-allocates all intermediate activation, scratch, KV-cache, and precomputed RoPE tables from `arena`.
     pub fn allocate(arena: &mut AlignedArena, cfg: &TransformerConfig) -> Self {
         assert_eq!(cfg.dim % QK4_0, 0, "dim must be a multiple of 32");
         assert_eq!(
@@ -66,15 +78,14 @@ impl LayerWorkspace {
             0,
             "dim must be divisible by num_heads"
         );
-        assert_eq!(
-            cfg.head_dim() % 2,
-            0,
-            "head_dim must be even for RoPE rotation"
-        );
+        let head_dim = cfg.head_dim();
+        assert_eq!(head_dim % 2, 0, "head_dim must be even for RoPE rotation");
 
         let max_q8_blocks = cfg.dim.max(cfg.hidden_dim) / QK4_0;
+        let half_head = head_dim / 2;
+        let rope_table_len = cfg.max_seq_len * half_head;
 
-        Self {
+        let ws = Self {
             x: arena.alloc_slice(cfg.dim),
             x_mid: arena.alloc_slice(cfg.dim),
             xb: arena.alloc_slice(cfg.dim),
@@ -87,6 +98,40 @@ impl LayerWorkspace {
             hb2: arena.alloc_slice(cfg.hidden_dim),
             hb_act: arena.alloc_slice(cfg.hidden_dim),
             q8_scratch: arena.alloc_q8_scratch(max_q8_blocks),
+            rope_cos: arena.alloc_slice(rope_table_len),
+            rope_sin: arena.alloc_slice(rope_table_len),
+        };
+
+        // Precompute RoPE cos/sin lookup tables once during workspace initialization
+        let head_dim_f = head_dim as f32;
+        for pos in 0..cfg.max_seq_len {
+            let pos_f = pos as f32;
+            for j in 0..half_head {
+                let freq = 1.0f32 / 10000.0f32.powf(((2 * j) as f32) / head_dim_f);
+                let (sin_a, cos_a) = (pos_f * freq).sin_cos();
+                arena.get_mut(ws.rope_cos)[pos * half_head + j] = cos_a;
+                arena.get_mut(ws.rope_sin)[pos * half_head + j] = sin_a;
+            }
+        }
+
+        ws
+    }
+}
+
+/// Applies Rotary Position Embedding (RoPE) in place using precomputed `cos`/`sin` tables for `pos`.
+#[inline]
+pub fn apply_rope_cached(vec: &mut [f32], cos_row: &[f32], sin_row: &[f32], head_dim: usize) {
+    let half_head = head_dim / 2;
+    debug_assert_eq!(cos_row.len(), half_head);
+    debug_assert_eq!(sin_row.len(), half_head);
+    for head_slice in vec.chunks_exact_mut(head_dim) {
+        for j in 0..half_head {
+            let cos_a = cos_row[j];
+            let sin_a = sin_row[j];
+            let v0 = head_slice[2 * j];
+            let v1 = head_slice[2 * j + 1];
+            head_slice[2 * j] = v0 * cos_a - v1 * sin_a;
+            head_slice[2 * j + 1] = v0 * sin_a + v1 * cos_a;
         }
     }
 }
@@ -109,7 +154,7 @@ pub fn apply_rope_in_place(vec: &mut [f32], pos: usize, head_dim: usize) {
     }
 }
 
-/// Executes causal multi-head scaled dot-product attention over `0..=pos`.
+/// Executes causal multi-head scaled dot-product attention over `0..=pos` using the scalar reference softmax.
 pub fn causal_multi_head_attention(
     q: &[f32],
     k_cache: &[f32],
@@ -165,6 +210,68 @@ pub fn causal_multi_head_attention(
     }
 }
 
+/// Executes causal multi-head scaled dot-product attention over `0..=pos` using the JIT-compiled `Softmax` kernel.
+pub fn causal_multi_head_attention_jit(
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    att: &mut [f32],
+    out: &mut [f32],
+    cfg: &TransformerConfig,
+    pos: usize,
+    softmax_fn: JitKernelFn,
+) {
+    let head_dim = cfg.head_dim();
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    let seq_len = pos + 1;
+
+    out.fill(0.0);
+
+    for h in 0..cfg.num_heads {
+        let head_off = h * head_dim;
+        let q_h = &q[head_off..head_off + head_dim];
+        let att_h = &mut att[h * cfg.max_seq_len..h * cfg.max_seq_len + seq_len];
+
+        for t in 0..seq_len {
+            let k_th = &k_cache[t * cfg.dim + head_off..t * cfg.dim + head_off + head_dim];
+            let mut dot = 0.0f32;
+            for i in 0..head_dim {
+                dot += q_h[i] * k_th[i];
+            }
+            att_h[t] = dot * scale;
+        }
+
+        let inputs = [att_h.as_ptr()];
+        unsafe {
+            softmax_fn(inputs.as_ptr(), att_h.as_mut_ptr(), seq_len);
+        }
+
+        let out_h = &mut out[head_off..head_off + head_dim];
+        for (t, &prob) in att_h.iter().enumerate() {
+            let v_th = &v_cache[t * cfg.dim + head_off..t * cfg.dim + head_off + head_dim];
+            for i in 0..head_dim {
+                out_h[i] += prob * v_th[i];
+            }
+        }
+    }
+}
+
+/// Dedicated per-layer KV-cache slices inside [`AlignedArena`].
+#[derive(Copy, Clone, Debug)]
+pub struct LayerKvCache {
+    pub k_cache: ArenaSlice,
+    pub v_cache: ArenaSlice,
+}
+
+impl LayerKvCache {
+    pub fn allocate(arena: &mut AlignedArena, cfg: &TransformerConfig) -> Self {
+        Self {
+            k_cache: arena.alloc_slice(cfg.max_seq_len * cfg.dim),
+            v_cache: arena.alloc_slice(cfg.max_seq_len * cfg.dim),
+        }
+    }
+}
+
 /// Self-contained Transformer layer wiring quantized GEMV projections and JIT-fused CLIR kernels
 /// on [`AlignedArena`].
 pub struct TransformerLayer {
@@ -173,6 +280,7 @@ pub struct TransformerLayer {
     pub rmsnorm_fn: JitKernelFn,
     pub swiglu_fn: JitKernelFn,
     pub residual_add_fn: JitKernelFn,
+    pub softmax_fn: JitKernelFn,
 }
 
 impl TransformerLayer {
@@ -185,6 +293,7 @@ impl TransformerLayer {
         let rmsnorm_fn = engine.compile(&FuseGraph::rmsnorm(config.dim, config.rms_eps));
         let swiglu_fn = engine.compile(&FuseGraph::swiglu());
         let residual_add_fn = engine.compile(&FuseGraph::residual_add());
+        let softmax_fn = engine.compile(&FuseGraph::softmax());
 
         Self {
             config,
@@ -192,11 +301,12 @@ impl TransformerLayer {
             rmsnorm_fn,
             swiglu_fn,
             residual_add_fn,
+            softmax_fn,
         }
     }
 
     /// Executes one full Transformer block (`Attention + SwiGLU FFN`) at token position `pos`
-    /// with zero heap allocations. Reads and updates `self.workspace.x` in place inside `arena`.
+    /// using the layer's default workspace KV-cache.
     pub fn forward_token(
         &self,
         engine: &JitEngine,
@@ -204,9 +314,27 @@ impl TransformerLayer {
         weights: &TransformerWeights<'_>,
         pos: usize,
     ) {
+        let kv = LayerKvCache {
+            k_cache: self.workspace.k_cache,
+            v_cache: self.workspace.v_cache,
+        };
+        self.forward_token_with_kv(engine, arena, weights, &kv, pos);
+    }
+
+    /// Executes one full Transformer block (`Attention + SwiGLU FFN`) at token position `pos`
+    /// using an explicit per-layer [`LayerKvCache`] with zero heap allocations.
+    pub fn forward_token_with_kv(
+        &self,
+        engine: &JitEngine,
+        arena: &mut AlignedArena,
+        weights: &TransformerWeights<'_>,
+        kv: &LayerKvCache,
+        pos: usize,
+    ) {
         let dim = self.config.dim;
         let hidden_dim = self.config.hidden_dim;
         let head_dim = self.config.head_dim();
+        let half_head = head_dim / 2;
         assert!(pos < self.config.max_seq_len, "sequence position out of bounds");
 
         let ws = &self.workspace;
@@ -214,22 +342,30 @@ impl TransformerLayer {
         // 1. Pre-Attention JIT RMSNorm: xb = rmsnorm(x, rms_att_weight)
         engine.exec_with_weights(self.rmsnorm_fn, arena, ws.x, weights.rms_att_weight, ws.xb);
 
-        // 2. Quantized QKV Projections directly into q, k_cache[pos], v_cache[pos]
-        let k_pos = ws.k_cache.subslice(pos * dim, dim);
-        let v_pos = ws.v_cache.subslice(pos * dim, dim);
+        // 2. Quantized QKV Projections directly into q, kv.k_cache[pos], kv.v_cache[pos]
+        let k_pos = kv.k_cache.subslice(pos * dim, dim);
+        let v_pos = kv.v_cache.subslice(pos * dim, dim);
         gemv_q4_0_arena(arena, weights.wq, ws.xb, ws.q8_scratch, ws.q, dim, dim);
         gemv_q4_0_arena(arena, weights.wk, ws.xb, ws.q8_scratch, k_pos, dim, dim);
         gemv_q4_0_arena(arena, weights.wv, ws.xb, ws.q8_scratch, v_pos, dim, dim);
 
-        // 3. Apply RoPE in place to Q and K[pos]
-        apply_rope_in_place(arena.get_mut(ws.q), pos, head_dim);
-        apply_rope_in_place(arena.get_mut(k_pos), pos, head_dim);
+        // 3. Apply RoPE in place to Q and K[pos] using precomputed arena tables
+        let cos_pos = ws.rope_cos.subslice(pos * half_head, half_head);
+        let sin_pos = ws.rope_sin.subslice(pos * half_head, half_head);
+        {
+            let (cos_s, sin_s, q_s) = arena.io2_slices(cos_pos, sin_pos, ws.q);
+            apply_rope_cached(q_s, cos_s, sin_s, head_dim);
+        }
+        {
+            let (cos_s, sin_s, k_s) = arena.io2_slices(cos_pos, sin_pos, k_pos);
+            apply_rope_cached(k_s, cos_s, sin_s, head_dim);
+        }
 
-        // 4. Causal Multi-Head Attention over 0..=pos -> xb
+        // 4. Causal Multi-Head Attention over 0..=pos with JIT Softmax -> xb
         {
             let (q_slice, kc_slice, vc_slice, att_slice, xb_slice) =
-                arena.attention_slices(ws.q, ws.k_cache, ws.v_cache, ws.att, ws.xb);
-            causal_multi_head_attention(
+                arena.attention_slices(ws.q, kv.k_cache, kv.v_cache, ws.att, ws.xb);
+            causal_multi_head_attention_jit(
                 q_slice,
                 kc_slice,
                 vc_slice,
@@ -237,6 +373,7 @@ impl TransformerLayer {
                 xb_slice,
                 &self.config,
                 pos,
+                self.softmax_fn,
             );
         }
 
@@ -290,10 +427,114 @@ impl TransformerLayer {
     }
 }
 
+/// Returns the index of the maximum logit value (greedy argmax token selection).
+#[inline]
+pub fn sample_argmax(logits: &[f32]) -> usize {
+    assert!(!logits.is_empty(), "logits cannot be empty");
+    let mut best_idx = 0usize;
+    let mut best_val = logits[0];
+    for (i, &val) in logits.iter().enumerate().skip(1) {
+        if val > best_val {
+            best_val = val;
+            best_idx = i;
+        }
+    }
+    best_idx
+}
+
+/// End-to-end zero-allocation Transformer model executing `token_embd` lookup, `L` Transformer layers,
+/// final `RMSNorm`, `lm_head` vocabulary projection, and greedy token sampling on [`AlignedArena`].
+pub struct TransformerModel {
+    pub layer: TransformerLayer,
+    pub kv_caches: Vec<LayerKvCache>,
+    pub logits: ArenaSlice,
+    pub vocab_size: usize,
+}
+
+impl TransformerModel {
+    /// Allocates workspace, per-layer KV-caches, and vocabulary logits in `arena`, and compiles JIT kernels.
+    pub fn new(
+        engine: &mut JitEngine,
+        arena: &mut AlignedArena,
+        config: TransformerConfig,
+        num_layers: usize,
+        vocab_size: usize,
+    ) -> Self {
+        assert!(vocab_size > 0, "vocab_size must be positive");
+        let ws = LayerWorkspace::allocate(arena, &config);
+        let kv_caches = (0..num_layers)
+            .map(|_| LayerKvCache::allocate(arena, &config))
+            .collect();
+        let logits = arena.alloc_slice(vocab_size);
+        let layer = TransformerLayer::new(engine, config, ws);
+
+        Self {
+            layer,
+            kv_caches,
+            logits,
+            vocab_size,
+        }
+    }
+
+    /// Executes a complete token-to-token forward pass for `token_id` at sequence position `pos`,
+    /// returning the greedy argmax next-token ID with zero heap allocations.
+    pub fn forward_token(
+        &self,
+        engine: &JitEngine,
+        arena: &mut AlignedArena,
+        weights: &ModelWeights<'_>,
+        token_id: usize,
+        pos: usize,
+    ) -> usize {
+        let dim = self.layer.config.dim;
+        let blocks_per_row = dim / QK4_0;
+        assert!(token_id < self.vocab_size, "token_id out of vocabulary bounds");
+        assert_eq!(weights.vocab_size, self.vocab_size, "vocab_size mismatch");
+        assert_eq!(
+            weights.layers.len(),
+            self.kv_caches.len(),
+            "layer count mismatch"
+        );
+
+        // 1. Dequantize token embedding row directly into workspace `x`
+        let embd_row =
+            &weights.token_embd[token_id * blocks_per_row..(token_id + 1) * blocks_per_row];
+        dequantize_row_q4_0(embd_row, arena.get_mut(self.layer.workspace.x));
+
+        // 2. Execute all L Transformer layers
+        for (lw, kv) in weights.layers.iter().zip(self.kv_caches.iter()) {
+            self.layer.forward_token_with_kv(engine, arena, lw, kv, pos);
+        }
+
+        // 3. Final output RMSNorm: xb = rmsnorm(x, output_norm)
+        engine.exec_with_weights(
+            self.layer.rmsnorm_fn,
+            arena,
+            self.layer.workspace.x,
+            weights.output_norm,
+            self.layer.workspace.xb,
+        );
+
+        // 4. Classifier LM Head GEMV: logits = lm_head * xb
+        gemv_q4_0_arena(
+            arena,
+            weights.lm_head,
+            self.layer.workspace.xb,
+            self.layer.workspace.q8_scratch,
+            self.logits,
+            self.vocab_size,
+            dim,
+        );
+
+        // 5. Greedy argmax token selection
+        sample_argmax(arena.get(self.logits))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::arena::tests::current_thread_allocs;
+    use crate::memory::arena::tests::current_thread_heap_ops;
     use crate::quant::blocks::{BlockQ8_0, QK8_0, quantize_row_q4_0, quantize_row_q8_0};
     use crate::quant::kernels::vec_dot_q4_0_q8_0_scalar;
     use bytemuck::Zeroable;
@@ -466,23 +707,92 @@ mod tests {
         };
 
         let mut engine = JitEngine::new();
-        let mut arena = AlignedArena::with_capacity(32768);
+        let mut arena = AlignedArena::with_capacity(65536);
         let ws = LayerWorkspace::allocate(&mut arena, &cfg);
+        let kv0 = LayerKvCache::allocate(&mut arena, &cfg);
+        let kv1 = LayerKvCache::allocate(&mut arena, &cfg);
         let layer = TransformerLayer::new(&mut engine, cfg, ws);
 
         let init_x = pseudo_random_f32(cfg.dim, 0x7777);
         arena.get_mut(layer.workspace.x).copy_from_slice(&init_x);
 
-        let allocs_before = current_thread_allocs();
+        let ops_before = current_thread_heap_ops();
         for pos in 0..cfg.max_seq_len {
-            layer.forward_token(&engine, &mut arena, &weights, pos);
+            layer.forward_token_with_kv(&engine, &mut arena, &weights, &kv0, pos);
+            layer.forward_token_with_kv(&engine, &mut arena, &weights, &kv1, pos);
         }
-        let allocs_after = current_thread_allocs();
+        let ops_after = current_thread_heap_ops();
 
         assert_eq!(
-            allocs_after, allocs_before,
-            "Expected 0 heap allocations during Transformer token generation loop, found {}",
-            allocs_after - allocs_before
+            ops_after, ops_before,
+            "Expected 0 heap allocs/deallocs during Transformer token generation loop, found {:?}",
+            (ops_after.0 - ops_before.0, ops_after.1 - ops_before.1)
+        );
+    }
+
+    #[test]
+    fn test_end_to_end_model_token_generation_zero_alloc() {
+        let cfg = TransformerConfig {
+            dim: 64,
+            hidden_dim: 128,
+            num_heads: 4,
+            max_seq_len: 16,
+            rms_eps: 1e-5,
+        };
+        let vocab_size = 128;
+        let num_layers = 2;
+
+        let token_embd = quantize_matrix(vocab_size, cfg.dim, 0x0100);
+        let output_norm = vec![1.0f32; cfg.dim];
+        let lm_head = quantize_matrix(vocab_size, cfg.dim, 0x0200);
+
+        let rms_att_w = pseudo_random_f32(cfg.dim, 0x1001);
+        let rms_ffn_w = pseudo_random_f32(cfg.dim, 0x1002);
+        let wq = quantize_matrix(cfg.dim, cfg.dim, 0x2001);
+        let wk = quantize_matrix(cfg.dim, cfg.dim, 0x2002);
+        let wv = quantize_matrix(cfg.dim, cfg.dim, 0x2003);
+        let wo = quantize_matrix(cfg.dim, cfg.dim, 0x2004);
+        let w_gate = quantize_matrix(cfg.hidden_dim, cfg.dim, 0x3001);
+        let w_up = quantize_matrix(cfg.hidden_dim, cfg.dim, 0x3002);
+        let w_down = quantize_matrix(cfg.dim, cfg.hidden_dim, 0x3003);
+
+        let lw = TransformerWeights {
+            rms_att_weight: &rms_att_w,
+            wq: &wq,
+            wk: &wk,
+            wv: &wv,
+            wo: &wo,
+            rms_ffn_weight: &rms_ffn_w,
+            w_gate: &w_gate,
+            w_up: &w_up,
+            w_down: &w_down,
+        };
+
+        let model_weights = ModelWeights {
+            token_embd: &token_embd,
+            layers: vec![lw; num_layers],
+            output_norm: &output_norm,
+            lm_head: &lm_head,
+            vocab_size,
+        };
+
+        let mut engine = JitEngine::new();
+        let mut arena = AlignedArena::with_capacity(65536);
+        let model = TransformerModel::new(&mut engine, &mut arena, cfg, num_layers, vocab_size);
+
+        let ops_before = current_thread_heap_ops();
+        let mut cur_token = 1usize;
+        for pos in 0..8 {
+            let next_token = model.forward_token(&engine, &mut arena, &model_weights, cur_token, pos);
+            assert!(next_token < vocab_size);
+            cur_token = next_token;
+        }
+        let ops_after = current_thread_heap_ops();
+
+        assert_eq!(
+            ops_after, ops_before,
+            "Expected 0 heap allocs/deallocs during full TransformerModel autoregressive decoding, found {:?}",
+            (ops_after.0 - ops_before.0, ops_after.1 - ops_before.1)
         );
     }
 }
