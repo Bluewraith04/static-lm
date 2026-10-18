@@ -46,21 +46,21 @@ cargo test
 | Model | Runtime | Prefill (`tok/s`) | Decode (`tok/s`) | Runtime Heap Allocs | Static Memory |
 | :--- | :--- | ---: | ---: | ---: | ---: |
 | **Synthetic (`1.8M`, `0.95 MiB`)** | `llama.cpp` (`llama-bench`) | 42,385.9 | 11,209.4 | — | — |
-| | **`static-lm`** | **3,661.7** | **2,010.8** | **0 (`0 KB`)** | **1.0 MB** |
+| | **`static-lm`** | **5,150.1** | **4,144.4** | **0 (`0 KB`)** | **1.0 MB** |
 | | HuggingFace `candle` (`0.8.4`) | 206.6 | 130.7 | Heap per op | — |
 | | In-tree static `f32` (`llama2.c`-style) | 633.6 | 583.8 | 0 (`0 KB`) | 6.8 MB |
 | | In-tree unfused scalar `Q4_0` | 514.7 | 398.3 | 0 (`0 KB`) | 1.0 MB |
 | **Stories-15M (`24.4M`, `13.1 MiB`)** | `llama.cpp` (`llama-bench`) | 4,251.8 | 636.6 | — | — |
-| | **`static-lm`** | **731.9** | **256.8** | **0 (`0 KB`)** | **16.6 MB** |
+| | **`static-lm`** | **1,271.7** | **469.4** | **0 (`0 KB`)** | **16.6 MB** |
 | | HuggingFace `candle` (`0.8.4`) | 36.4 | 26.9 | Heap per op | — |
 | | In-tree static `f32` (`llama2.c`-style) | 147.2 | 65.7 | 0 (`0 KB`) | 96.6 MB |
 | | In-tree unfused scalar `Q4_0` | 129.7 | 65.9 | 0 (`0 KB`) | 16.6 MB |
 | **SmolLM2-135M (`134.5M`, `72.3 MiB`)** | `llama.cpp` (`llama-bench`) | 442.8 | 125.2 | — | — |
-| | **`static-lm`** | **76.7** | **37.3** | **0 (`0 KB`)** | **110.2 MB** |
+| | **`static-lm`** | **78.4** | **54.6** | **0 (`0 KB`)** | **110.2 MB** |
 | | HuggingFace `candle` (`0.8.4`) | 7.1 | 5.1 | Heap per op | — |
 | | In-tree static `f32` (`llama2.c`-style) | 8.4 | 6.7 | 0 (`0 KB`) | 643.9 MB |
 | | In-tree unfused scalar `Q4_0` | 5.6 | 5.2 | 0 (`0 KB`) | 110.2 MB |
 
-- **vs. HuggingFace `candle` (`0.8.4` CPU):** `static-lm` is **7.3×–10.8× faster on decode** and **9.5×–20.1× faster on prefill** across real-world models (`Stories-15M` and `SmolLM2-135M`).
-- **vs. `llama.cpp` (`ggml-cpu`):** `static-lm` reaches **29%–40% of `llama.cpp` decode throughput** (`256.8` vs. `636.6 tok/s` on `Stories-15M`; `37.3` vs. `125.2 tok/s` on `SmolLM2-135M`); the remaining gap comes from `ggml`'s multi-row register-blocked `GEMV`/`GEMM` microkernels and SIMD attention scoring (`static-lm` uses single-row `Q4_0 × Q8_0` dot products and scalar `QK^T`/`AV` attention loops).
-- **vs. In-tree baselines:** `static-lm` is **4.7×–10.5× faster** than unfused scalar `Q4_0` and uses **5.8× less RAM** (`110.2 MB` vs. `643.9 MB` on `SmolLM2-135M`) than pre-dequantized `f32` while eliminating the `14,552` heap allocations (`53.4 MB` transient heap churn) of per-operator `Vec<f32>` execution.
+- **vs. HuggingFace `candle` (`0.8.4` CPU):** `static-lm` is **10.7×–17.4× faster on decode** and **11×–35× faster on prefill** on the two real-world models (`Stories-15M` and `SmolLM2-135M`).
+- **vs. `llama.cpp` (`ggml-cpu`):** `static-lm` reaches **44%–74% of `llama.cpp` decode throughput** (`469.4` vs. `636.6 tok/s` on `Stories-15M`; `54.6` vs. `125.2 tok/s` on `SmolLM2-135M`) and **18%–30% of its prefill throughput**. The remaining gap comes from `ggml`'s multi-row register-blocked `GEMV`/`GEMM` microkernels and SIMD attention scoring (`static-lm` uses single-row `Q4_0 × Q8_0` dot products and scalar `QK^T`/`AV` attention loops). `llama.cpp` figures were measured on the same machine with run-to-run variance of up to ±50% at these small sizes.
+- **vs. In-tree baselines:** `static-lm` is **7×–14× faster** than unfused scalar `Q4_0` and uses **5.8× less RAM** (`110.2 MB` vs. `643.9 MB` on `SmolLM2-135M`) than pre-dequantized `f32`, while avoiding the `14,552` heap allocations (`53.4 MB` of transient heap churn) of per-operator `Vec<f32>` execution.

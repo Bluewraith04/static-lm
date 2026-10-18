@@ -4,7 +4,10 @@ use std::thread::{self, Thread};
 
 use crate::quant::blocks::{BlockQ4_0, BlockQ8_0, QK4_0};
 
-const PARALLEL_THRESHOLD_BLOCKS: usize = 8_192;
+const PARALLEL_THRESHOLD_BLOCKS: usize = 2_048;
+/// Worker spin iterations before falling back to `thread::park()`; keeps workers hot across
+/// the hundreds of back-to-back matrix dispatches in a single token step.
+const SPIN_ITERS_BEFORE_PARK: u32 = 20_000;
 
 struct GemvJobState {
     weights_ptr: AtomicUsize,
@@ -89,8 +92,14 @@ pub fn init_gemv_pool() {
                 let mut seen_gen = 0usize;
                 loop {
                     let mut cur_gen = state.generation.load(Ordering::Acquire);
+                    let mut spins = 0u32;
                     while cur_gen == seen_gen {
-                        thread::park();
+                        if spins < SPIN_ITERS_BEFORE_PARK {
+                            std::hint::spin_loop();
+                            spins += 1;
+                        } else {
+                            thread::park();
+                        }
                         cur_gen = state.generation.load(Ordering::Acquire);
                     }
                     seen_gen = cur_gen;
